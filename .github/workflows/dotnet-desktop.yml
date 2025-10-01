@@ -1,0 +1,29 @@
+name: Build and Release MineLights Server
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Publish
+      run: dotnet publish Server/MineLights/MineLights.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o ./publish
+
+    - name: Upload MineLights.exe to GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ./publish/MineLights.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
