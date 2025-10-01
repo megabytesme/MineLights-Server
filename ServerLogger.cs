@@ -2,9 +2,7 @@
 
 public sealed class ServerLogger : TextWriter
 {
-    private static readonly Lazy<ServerLogger> _instance = new Lazy<ServerLogger>(() =>
-        new ServerLogger()
-    );
+    private static readonly Lazy<ServerLogger> _instance = new(() => new ServerLogger());
     public static ServerLogger Instance => _instance.Value;
 
     private readonly StreamWriter _fileWriter;
@@ -20,14 +18,32 @@ public sealed class ServerLogger : TextWriter
 
         try
         {
-            string logDirectory = Path.Combine(Path.GetTempPath(), "MineLights");
+            string logDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
             Directory.CreateDirectory(logDirectory);
-            _logFilePath = Path.Combine(logDirectory, "server.log");
 
-            _fileWriter = new StreamWriter(_logFilePath, append: true, Encoding.UTF8)
+            var logFiles = new DirectoryInfo(logDirectory)
+                .GetFiles("MineLights_*.log")
+                .OrderByDescending(f => f.CreationTimeUtc)
+                .ToList();
+            foreach (var oldFile in logFiles.Skip(5))
             {
-                AutoFlush = true,
-            };
+                try
+                {
+                    oldFile.Delete();
+                }
+                catch { }
+            }
+
+            string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            _logFilePath = Path.Combine(logDirectory, $"MineLights_{timestamp}.log");
+
+            var fileStream = new FileStream(
+                _logFilePath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.ReadWrite
+            );
+            _fileWriter = new StreamWriter(fileStream, Encoding.UTF8) { AutoFlush = true };
 
             Log("----------------------------------------------------------");
             Log($"Log session started at {DateTime.Now:F}");
@@ -50,15 +66,11 @@ public sealed class ServerLogger : TextWriter
         }
 
         string formattedMessage = $"[{DateTime.Now:HH:mm:ss}] {message}";
-
         _originalConsoleOut.WriteLine(formattedMessage);
         _fileWriter.WriteLine(formattedMessage);
     }
 
-    public void Log(string message)
-    {
-        WriteLine(message);
-    }
+    public void Log(string message) => WriteLine(message);
 
     protected override void Dispose(bool disposing)
     {
