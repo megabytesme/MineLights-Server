@@ -40,8 +40,29 @@ public static class KeyMapper
         { LedId.Keyboard_ArrowRight, "RIGHT" }, { LedId.Keyboard_Insert, "INSERT" },
         { LedId.Keyboard_Delete, "DELETE" }, { LedId.Keyboard_Home, "HOME" },
         { LedId.Keyboard_End, "END" }, { LedId.Keyboard_PageUp, "PAGE_UP" },
-        { LedId.Keyboard_PageDown, "PAGE_DOWN" }, { LedId.Keyboard_PrintScreen, "PRINT_SCREEN" },
-        { LedId.Keyboard_ScrollLock, "SCROLL_LOCK" }, { LedId.Keyboard_PauseBreak, "PAUSE" }
+        { LedId.Keyboard_PageDown, "PAGE_DOWN" }, { LedId.Keyboard_PrintScreen, "PRINTSCREEN" },
+        { LedId.Keyboard_ScrollLock, "SCROLLLOCK" }, { LedId.Keyboard_PauseBreak, "PAUSE" },
+        { LedId.Keyboard_GraveAccentAndTilde, "BACKTICK" },
+        { LedId.Keyboard_MinusAndUnderscore, "MINUS" },
+        { LedId.Keyboard_EqualsAndPlus, "EQUALS" },
+        { LedId.Keyboard_BracketLeft, "LEFT_BRACKET" },
+        { LedId.Keyboard_BracketRight, "RIGHT_BRACKET" },
+        { LedId.Keyboard_SemicolonAndColon, "SEMICOLON" },
+        { LedId.Keyboard_ApostropheAndDoubleQuote, "APOSTROPHE" },
+        { LedId.Keyboard_CommaAndLessThan, "COMMA" },
+        { LedId.Keyboard_PeriodAndBiggerThan, "PERIOD" },
+        { LedId.Keyboard_SlashAndQuestionMark, "SLASH" },
+        { LedId.Keyboard_Backslash, "BACKSLASH" },
+        { LedId.Keyboard_NonUsBackslash, "ISO_BACKSLASH" },
+        { LedId.Keyboard_NonUsTilde, "ISO_TILDE" },
+        { LedId.Keyboard_MediaMute, "MEDIA_MUTE" },
+        { LedId.Keyboard_MediaStop, "MEDIA_STOP" },
+        { LedId.Keyboard_MediaPlay, "MEDIA_PLAY_PAUSE" },
+        { LedId.Keyboard_MediaNextTrack, "MEDIA_NEXT" },
+        { LedId.Keyboard_MediaPreviousTrack, "MEDIA_PREVIOUS" },
+        { LedId.Keyboard_WinLock, "WINLOCK" },
+        { LedId.Keyboard_Application, "MENU" }
     };
+
     public static string? GetFriendlyName(LedId ledId) => _map.TryGetValue(ledId, out var name) ? name : null;
 }

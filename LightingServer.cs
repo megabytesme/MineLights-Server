@@ -188,20 +188,42 @@ public class LightingServer
         _ledIdMap.Clear();
         _keyMap.Clear();
         int currentLedId = 0;
-        foreach (var device in _surface.Devices.OrderBy(d => d.DeviceInfo.DeviceType))
+
+        Console.WriteLine("[Server] Building new LED and Key maps...");
+        foreach (var device in _surface.Devices.OrderBy(d => d.DeviceInfo.DeviceType).ThenBy(d => d.DeviceInfo.Model))
         {
+            Console.WriteLine($"[Server] > Mapping device: '{device.DeviceInfo.Model}' ({device.Count()} LEDs)");
             foreach (var led in device)
             {
                 _ledIdMap.Add(currentLedId, led);
-                string? friendlyName = KeyMapper.GetFriendlyName(led.Id);
-                if (friendlyName != null && !_keyMap.ContainsKey(friendlyName))
+
+                string? keyName = KeyMapper.GetFriendlyName(led.Id);
+                string nameSource;
+
+                if (keyName != null)
                 {
-                    _keyMap.Add(friendlyName, currentLedId);
+                    nameSource = "Friendly";
                 }
+                else
+                {
+                    keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
+                    nameSource = "Generated";
+                }
+
+                if (!_keyMap.ContainsKey(keyName))
+                {
+                    _keyMap.Add(keyName, currentLedId);
+                    Console.WriteLine($" LED {currentLedId,3}: Mapped as {nameSource,-9} name -> '{keyName}'");
+                }
+                else
+                {
+                    Console.WriteLine($" LED {currentLedId,3}: Is '{keyName}' (name already mapped, skipping)");
+                }
+
                 currentLedId++;
             }
         }
-        Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} LEDs and {_keyMap.Count} named keys.");
+        Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} total LEDs and {_keyMap.Count} unique named keys.");
     }
 
     private void HandshakeServerLoop()
