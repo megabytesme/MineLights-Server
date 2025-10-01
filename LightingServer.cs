@@ -1,5 +1,4 @@
-﻿using System.Diagnostics;
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Newtonsoft.Json;
@@ -18,12 +17,20 @@ using RGB.NET.Devices.Wooting;
 public class LightingServer
 {
     private volatile bool _isRunning = false;
-    private readonly RGBSurface _surface;
-    private readonly Dictionary<int, Led> _ledIdMap = new Dictionary<int, Led>();
+    private CancellationTokenSource _cts = new();
+
     private Thread? _handshakeThread,
         _udpListenerThread,
         _commandListenerThread,
         _discoveryThread;
+
+    private TcpListener? _handshakeListener;
+    private UdpClient? _udpClient;
+    private TcpListener? _commandListener;
+    private UdpClient? _discoveryClient;
+
+    private readonly RGBSurface _surface;
+    private readonly Dictionary<int, Led> _ledIdMap = new();
     private readonly Action _shutdownAction;
     private readonly object _deviceLock = new object();
 
@@ -79,6 +86,8 @@ public class LightingServer
                         "Msi",
                     };
                 }
+                if (config.DisabledDevices == null)
+                    config.DisabledDevices = new List<string>();
                 return config;
             }
         }
@@ -102,6 +111,7 @@ public class LightingServer
                 "SteelSeries",
                 "Msi",
             },
+            DisabledDevices = new List<string>(),
         };
     }
 
@@ -122,12 +132,44 @@ public class LightingServer
     public void Start()
     {
         _isRunning = true;
+        _cts = new CancellationTokenSource();
+
         ReconfigureSurfaceFromConfig();
 
-        _handshakeThread = new Thread(HandshakeServerLoop) { IsBackground = true };
-        _udpListenerThread = new Thread(UdpServerLoop) { IsBackground = true };
-        _commandListenerThread = new Thread(CommandServerLoop) { IsBackground = true };
-        _discoveryThread = new Thread(DiscoveryBroadcastLoop) { IsBackground = true };
+        _handshakeListener = new TcpListener(IPAddress.Any, 63211);
+        _handshakeListener.Start();
+
+        _udpClient = new UdpClient(63212);
+        Console.WriteLine("[Server] UDP lighting listener on port 63212.");
+
+        _commandListener = new TcpListener(IPAddress.Any, 63213);
+        _commandListener.Start();
+        Console.WriteLine("[Server] Command server listening on port 63213.");
+
+        _discoveryClient = new UdpClient { EnableBroadcast = true };
+        Console.WriteLine("[Server] Discovery broadcast started on port 63214.");
+
+        _handshakeThread = new Thread(() => HandshakeServerLoop(_cts.Token))
+        {
+            IsBackground = true,
+            Name = "Handshake",
+        };
+        _udpListenerThread = new Thread(() => UdpServerLoop(_cts.Token))
+        {
+            IsBackground = true,
+            Name = "UDP Listener",
+        };
+        _commandListenerThread = new Thread(() => CommandServerLoop(_cts.Token))
+        {
+            IsBackground = true,
+            Name = "Command Listener",
+        };
+        _discoveryThread = new Thread(() => DiscoveryBroadcastLoop(_cts.Token))
+        {
+            IsBackground = true,
+            Name = "Discovery",
+        };
+
         _handshakeThread.Start();
         _udpListenerThread.Start();
         _commandListenerThread.Start();
@@ -137,17 +179,74 @@ public class LightingServer
     public void Stop()
     {
         _isRunning = false;
+        _cts.Cancel();
+
+        try
+        {
+            _handshakeListener?.Stop();
+        }
+        catch { }
+        try
+        {
+            _commandListener?.Stop();
+        }
+        catch { }
+        try
+        {
+            _udpClient?.Close();
+        }
+        catch { }
+        try
+        {
+            _discoveryClient?.Close();
+        }
+        catch { }
+
+        Join(_handshakeThread);
+        Join(_udpListenerThread);
+        Join(_commandListenerThread);
+        Join(_discoveryThread);
+
         lock (_deviceLock)
         {
             var devicesToDetach = _surface.Devices.ToList();
-            if (devicesToDetach.Any())
-                _surface.Detach(devicesToDetach);
+            if (devicesToDetach.Count > 0)
+            {
+                try
+                {
+                    _surface.Detach(devicesToDetach);
+                }
+                catch { }
+            }
 
             foreach (var provider in _allProviders)
-                if (provider.IsInitialized)
-                    provider.Dispose();
+            {
+                try
+                {
+                    if (provider.IsInitialized && provider is IDisposable d)
+                        d.Dispose();
+                }
+                catch { }
+            }
         }
-        _surface.Dispose();
+
+        try
+        {
+            _surface.Dispose();
+        }
+        catch { }
+    }
+
+    private static void Join(Thread? t, int ms = 3000)
+    {
+        if (t == null)
+            return;
+        try
+        {
+            if (t.IsAlive)
+                t.Join(ms);
+        }
+        catch { }
     }
 
     private void ReconfigureSurfaceFromConfig()
@@ -167,7 +266,7 @@ public class LightingServer
 
                 if (shouldBeEnabled && !provider.IsInitialized)
                 {
-                    if (provider is MsiDeviceProvider && !IsRunningAsAdmin())
+                    if (provider is MsiDeviceProvider && !Program.IsRunningAsAdmin())
                     {
                         Console.WriteLine(
                             $"[Server] -> Skipping {providerName}: Not running as admin."
@@ -182,14 +281,18 @@ public class LightingServer
                     catch (Exception ex)
                     {
                         Console.WriteLine(
-                            $"[Server] -> WARNING: Initializing {providerName} failed. Details: {ex.ToString()}"
+                            $"[Server] -> WARNING: Initializing {providerName} failed. Details: {ex}"
                         );
                     }
                 }
                 else if (!shouldBeEnabled && provider.IsInitialized)
                 {
                     Console.WriteLine($"[Server] Disposing disabled provider: {providerName}");
-                    provider.Dispose();
+                    try
+                    {
+                        provider.Dispose();
+                    }
+                    catch { }
                 }
             }
 
@@ -204,9 +307,7 @@ public class LightingServer
                 .ToList();
 
             if (devicesToAttach.Any())
-            {
                 _surface.Attach(devicesToAttach);
-            }
 
             Console.WriteLine($"[RGB.NET] Final device count: {_surface.Devices.Count()}");
             BuildIdMaps();
@@ -221,21 +322,24 @@ public class LightingServer
         foreach (var device in _surface.Devices)
         {
             foreach (var led in device)
-            {
                 _ledIdMap.Add(currentLedId++, led);
-            }
         }
         Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} total LEDs across all devices.");
     }
 
-    private void HandshakeServerLoop()
+    private void HandshakeServerLoop(CancellationToken ct)
     {
-        var listener = new TcpListener(IPAddress.Any, 63211);
+        var listener = _handshakeListener!;
         try
         {
-            listener.Start();
-            while (_isRunning)
+            while (_isRunning && !ct.IsCancellationRequested)
             {
+                if (!listener.Pending())
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
                 using var client = listener.AcceptTcpClient();
                 using var stream = client.GetStream();
 
@@ -248,9 +352,11 @@ public class LightingServer
                 _config.EnabledIntegrations =
                     clientConfig["enabled_integrations"]?.ToObject<List<string>>()
                     ?? _config.EnabledIntegrations;
+
                 _config.DisabledDevices =
                     clientConfig["disabled_devices"]?.ToObject<List<string>>()
                     ?? _config.DisabledDevices;
+
                 SaveConfig();
                 ReconfigureSurfaceFromConfig();
 
@@ -276,14 +382,10 @@ public class LightingServer
 
                             string? keyName = KeyMapper.GetFriendlyName(led.Id);
                             if (keyName == null)
-                            {
                                 keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
-                            }
 
                             if (!deviceKeyMap.ContainsKey(keyName))
-                            {
                                 deviceKeyMap.Add(keyName, ledId);
-                            }
                         }
 
                         if (!deviceLeds.Any())
@@ -310,25 +412,41 @@ public class LightingServer
                 }
             }
         }
+        catch (ObjectDisposedException) { }
         catch (SocketException) { }
         finally
         {
-            listener.Stop();
+            try
+            {
+                listener.Stop();
+            }
+            catch { }
         }
     }
 
-    private void UdpServerLoop()
+    private void UdpServerLoop(CancellationToken ct)
     {
-        using var udpClient = new UdpClient(63212);
-        Console.WriteLine("[Server] UDP lighting listener on port 63212.");
-        var from = new IPEndPoint(0, 0);
-        while (_isRunning)
+        var udpClient = _udpClient!;
+        var from = new IPEndPoint(IPAddress.Any, 0);
+        try
         {
-            try
+            while (_isRunning && !ct.IsCancellationRequested)
             {
+                if (udpClient.Available == 0)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+
                 byte[] recvBuffer = udpClient.Receive(ref from);
                 string jsonString = Encoding.UTF8.GetString(recvBuffer);
-                JObject? frameData = JObject.Parse(jsonString);
+
+                JObject? frameData = null;
+                try
+                {
+                    frameData = JObject.Parse(jsonString);
+                }
+                catch { }
 
                 if (frameData?["led_colors"] is JArray colors)
                 {
@@ -339,98 +457,90 @@ public class LightingServer
                         int g = item.Value<int>("g");
                         int b = item.Value<int>("b");
                         if (_ledIdMap.TryGetValue(id, out Led led))
-                        {
                             led.Color = new RGB.NET.Core.Color((byte)r, (byte)g, (byte)b);
-                        }
                     }
                     _surface.Update();
                 }
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (SocketException) { }
+    }
+
+    private void CommandServerLoop(CancellationToken ct)
+    {
+        var listener = _commandListener!;
+        try
+        {
+            while (_isRunning && !ct.IsCancellationRequested)
+            {
+                if (!listener.Pending())
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
+                using var client = listener.AcceptTcpClient();
+                using var stream = client.GetStream();
+
+                var buffer = new byte[1024];
+                int bytesRead = 0;
+                try
+                {
+                    bytesRead = stream.Read(buffer, 0, buffer.Length);
+                }
+                catch
+                {
+                    bytesRead = 0;
+                }
+
+                if (bytesRead <= 0)
+                    continue;
+
+                string command = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+                if (string.Equals(command, "restart_admin", StringComparison.OrdinalIgnoreCase))
+                    Program.RequestRestart(true);
+                else if (string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase))
+                    Program.RequestRestart(false);
+                else if (string.Equals(command, "shutdown", StringComparison.OrdinalIgnoreCase))
+                    _shutdownAction?.Invoke();
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (SocketException) { }
+        finally
+        {
+            try
+            {
+                listener.Stop();
             }
             catch { }
         }
     }
 
-    private void CommandServerLoop()
+    private void DiscoveryBroadcastLoop(CancellationToken ct)
     {
-        var listener = new TcpListener(IPAddress.Any, 63213);
-        try
-        {
-            listener.Start();
-            Console.WriteLine("[Server] Command server listening on port 63213.");
-            while (_isRunning)
-            {
-                using var client = listener.AcceptTcpClient();
-                using var stream = client.GetStream();
-
-                var buffer = new byte[1024];
-                int bytesRead = stream.Read(buffer, 0, buffer.Length);
-                string command = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-                if (command == "restart_admin")
-                    TriggerRestart(true);
-                else if (command == "restart")
-                    TriggerRestart(false);
-                else if (command == "shutdown")
-                    _shutdownAction?.Invoke();
-            }
-        }
-        catch (SocketException) { }
-        finally
-        {
-            listener.Stop();
-        }
-    }
-
-    private void DiscoveryBroadcastLoop()
-    {
-        using var client = new UdpClient { EnableBroadcast = true };
+        var client = _discoveryClient!;
         var endpoint = new IPEndPoint(IPAddress.Broadcast, 63214);
         byte[] message = Encoding.UTF8.GetBytes("MINELIGHTS_PROXY_HELLO");
-        Console.WriteLine("[Server] Discovery broadcast started on port 63214.");
-        while (_isRunning)
+
+        try
         {
-            try
+            while (_isRunning && !ct.IsCancellationRequested)
             {
-                client.Send(message, message.Length, endpoint);
+                try
+                {
+                    client.Send(message, message.Length, endpoint);
+                }
+                catch (SocketException)
+                {
+                    break;
+                }
                 Thread.Sleep(5000);
             }
-            catch (SocketException)
-            {
-                break;
-            }
         }
-    }
-
-    private void TriggerRestart(bool asAdmin)
-    {
-        try
-        {
-            Process.Start(
-                new ProcessStartInfo(Application.ExecutablePath)
-                {
-                    UseShellExecute = true,
-                    Verb = asAdmin ? "runas" : "open",
-                }
-            );
-            _shutdownAction?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Restart ERROR] {ex.Message}");
-        }
-    }
-
-    private bool IsRunningAsAdmin()
-    {
-        try
-        {
-            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-            var principal = new System.Security.Principal.WindowsPrincipal(identity);
-            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-        }
-        catch
-        {
-            return false;
-        }
+        catch (ObjectDisposedException) { }
+        catch (SocketException) { }
     }
 }

@@ -1,23 +1,54 @@
 ﻿using System.Diagnostics;
 using System.Reflection;
+using System.Security.Principal;
 using MethodInvoker = System.Windows.Forms.MethodInvoker;
 
-class Program
+static class Program
 {
-    private static Mutex mutex = new Mutex(true, "{8E2D4B6C-7F01-4A5D-9C2E-2A47A5A0A9A3}");
+    private static readonly string MutexName = "{8E2D4B6C-7F01-4A5D-9C2E-2A47A5A0A9A3}";
+    private static Mutex? _mutex;
 
     [STAThread]
     static void Main(string[] args)
     {
+        if (args.Length >= 2 && args[0] == "--restart-helper")
+        {
+            int parentPid = int.Parse(args[1]);
+            bool asAdmin = args.Any(a => a == "--elevated");
+
+            try
+            {
+                using var parent = Process.GetProcessById(parentPid);
+                parent.WaitForExit();
+            }
+            catch { }
+
+            var psi = new ProcessStartInfo(Application.ExecutablePath)
+            {
+                UseShellExecute = true,
+                Verb = asAdmin ? "runas" : "open",
+            };
+            Process.Start(psi);
+            return;
+        }
+
         Console.SetOut(ServerLogger.Instance);
 
-        if (!mutex.WaitOne(TimeSpan.Zero, true))
+        _mutex = new Mutex(initiallyOwned: false, name: MutexName, out bool createdNew);
+        bool mutexAcquired = false;
+        try
+        {
+            mutexAcquired = _mutex.WaitOne(TimeSpan.FromSeconds(2), exitContext: false);
+        }
+        catch { }
+
+        if (!mutexAcquired)
         {
             MessageBox.Show(
                 "MineLights Server is already running.",
                 "MineLights",
                 MessageBoxButtons.OK,
-                MessageBoxIcon.Information
+                MessageBoxIcon.Error
             );
             return;
         }
@@ -28,8 +59,42 @@ class Program
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MyAppContext());
 
-        mutex.ReleaseMutex();
-        GC.KeepAlive(mutex);
+        try
+        {
+            _mutex.ReleaseMutex();
+        }
+        catch { }
+        _mutex?.Dispose();
+        _mutex = null;
+    }
+
+    public static void RequestRestart(bool asAdmin)
+    {
+        var current = Process.GetCurrentProcess();
+        var args = $"--restart-helper {current.Id}" + (asAdmin ? " --elevated" : "");
+        var psi = new ProcessStartInfo(Application.ExecutablePath)
+        {
+            UseShellExecute = true,
+            Verb = "open",
+            Arguments = args,
+        };
+        Process.Start(psi);
+
+        Application.Exit();
+    }
+
+    public static bool IsRunningAsAdmin()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
 
@@ -49,7 +114,7 @@ public class MyAppContext : ApplicationContext
         if (iconStream == null)
             throw new FileNotFoundException("Tray icon resource not found.");
 
-        trayIcon = new NotifyIcon()
+        trayIcon = new NotifyIcon
         {
             Icon = new Icon(iconStream),
             Text = "MineLights Server",
@@ -68,18 +133,14 @@ public class MyAppContext : ApplicationContext
         {
             string logPath = ServerLogger.Instance.LogFilePath;
             if (File.Exists(logPath))
-            {
                 Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
-            }
             else
-            {
                 MessageBox.Show(
                     "Log file not found.",
                     "Error",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
-            }
         }
         catch (Exception ex)
         {
@@ -94,20 +155,27 @@ public class MyAppContext : ApplicationContext
 
     private void Shutdown()
     {
-        if (trayIcon.ContextMenuStrip?.InvokeRequired ?? false)
+        if (trayIcon?.ContextMenuStrip?.InvokeRequired ?? false)
         {
             trayIcon.ContextMenuStrip.Invoke(new MethodInvoker(Shutdown));
+            return;
         }
-        else
+
+        try
         {
             lightingServer.Stop();
-            trayIcon.Visible = false;
-            Application.Exit();
         }
+        catch { }
+
+        try
+        {
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+        }
+        catch { }
+
+        Application.ExitThread();
     }
 
-    void OnExit(object? sender, EventArgs e)
-    {
-        Shutdown();
-    }
+    private void OnExit(object? sender, EventArgs e) => Shutdown();
 }
