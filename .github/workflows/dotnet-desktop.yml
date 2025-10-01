@@ -2,7 +2,6 @@ name: Build and Release MineLights Server
 
 on:
   push:
-    branches: [ master ]
     tags:
       - 'v*'
 
@@ -19,10 +18,10 @@ jobs:
       with:
         dotnet-version: '9.0.x'
 
-    - name: Publish
-      run: dotnet publish Server/MineLights/MineLights.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o ./publish
+    - name: Publish self-contained exe
+      run: dotnet publish MineLights.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o ./publish
 
-    - name: Upload MineLights.exe to GitHub Release
+    - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v1
       with:
         files: ./publish/MineLights.exe
