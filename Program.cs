@@ -122,7 +122,21 @@ public class MyAppContext : ApplicationContext
             Visible = true,
         };
 
-        trayIcon.ContextMenuStrip.Items.Add("View Logs", null, OnViewLogs);
+        trayIcon.ContextMenuStrip.Items.Add("View Current Log", null, OnViewLogs);
+        trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+        var logsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+        var logs = Directory.GetFiles(logsDir, "MineLights_*.log")
+                            .OrderByDescending(File.GetCreationTimeUtc)
+                            .Take(5);
+
+        foreach (var log in logs)
+        {
+            trayIcon.ContextMenuStrip.Items.Add(
+                Path.GetFileName(log),
+                null,
+                (s, e) => Process.Start(new ProcessStartInfo(log) { UseShellExecute = true })
+            );
+        }
         trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         trayIcon.ContextMenuStrip.Items.Add("Exit", null, OnExit);
     }
