@@ -20,7 +20,6 @@ public class LightingServer
     private volatile bool _isRunning = false;
     private readonly RGBSurface _surface;
     private readonly Dictionary<int, Led> _ledIdMap = new Dictionary<int, Led>();
-    private readonly Dictionary<string, int> _keyMap = new Dictionary<string, int>();
     private Thread? _handshakeThread, _udpListenerThread, _commandListenerThread, _discoveryThread;
     private readonly Action _shutdownAction;
     private readonly object _deviceLock = new object();
@@ -186,44 +185,16 @@ public class LightingServer
     private void BuildIdMaps()
     {
         _ledIdMap.Clear();
-        _keyMap.Clear();
         int currentLedId = 0;
 
-        Console.WriteLine("[Server] Building new LED and Key maps...");
-        foreach (var device in _surface.Devices.OrderBy(d => d.DeviceInfo.DeviceType).ThenBy(d => d.DeviceInfo.Model))
+        foreach (var device in _surface.Devices)
         {
-            Console.WriteLine($"[Server] > Mapping device: '{device.DeviceInfo.Model}' ({device.Count()} LEDs)");
             foreach (var led in device)
             {
-                _ledIdMap.Add(currentLedId, led);
-
-                string? keyName = KeyMapper.GetFriendlyName(led.Id);
-                string nameSource;
-
-                if (keyName != null)
-                {
-                    nameSource = "Friendly";
-                }
-                else
-                {
-                    keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
-                    nameSource = "Generated";
-                }
-
-                if (!_keyMap.ContainsKey(keyName))
-                {
-                    _keyMap.Add(keyName, currentLedId);
-                    Console.WriteLine($" LED {currentLedId,3}: Mapped as {nameSource,-9} name -> '{keyName}'");
-                }
-                else
-                {
-                    Console.WriteLine($" LED {currentLedId,3}: Is '{keyName}' (name already mapped, skipping)");
-                }
-
-                currentLedId++;
+                _ledIdMap.Add(currentLedId++, led);
             }
         }
-        Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} total LEDs and {_keyMap.Count} unique named keys.");
+        Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} total LEDs across all devices.");
     }
 
     private void HandshakeServerLoop()
@@ -251,22 +222,43 @@ public class LightingServer
                 lock (_deviceLock)
                 {
                     var devicesArray = new JArray();
-                    foreach (var device in _surface.Devices)
+                    foreach (var device in _surface.Devices.OrderBy(d => d.DeviceInfo.DeviceType).ThenBy(d => d.DeviceInfo.Model))
                     {
-                        var deviceLeds = device.Select(led => _ledIdMap.FirstOrDefault(x => x.Value == led).Key).Where(k => k != 0 || _ledIdMap.Count == 1).ToArray();
+                        var deviceKeyMap = new JObject();
+                        var deviceLeds = new List<int>();
+
+                        foreach (var led in device)
+                        {
+                            var mapping = _ledIdMap.FirstOrDefault(x => x.Value == led);
+                            if (mapping.Value == null) continue;
+                            int ledId = mapping.Key;
+                            deviceLeds.Add(ledId);
+
+                            string? keyName = KeyMapper.GetFriendlyName(led.Id);
+                            if (keyName == null)
+                            {
+                                keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
+                            }
+
+                            if (!deviceKeyMap.ContainsKey(keyName))
+                            {
+                                deviceKeyMap.Add(keyName, ledId);
+                            }
+                        }
+
                         if (!deviceLeds.Any()) continue;
+
                         var deviceObj = new JObject
                         {
                             ["sdk"] = device.DeviceInfo.Manufacturer,
                             ["name"] = device.DeviceInfo.Model,
-                            ["ledCount"] = deviceLeds.Length,
-                            ["leds"] = new JArray(deviceLeds)
+                            ["leds"] = new JArray(deviceLeds),
+                            ["key_map"] = deviceKeyMap
                         };
                         devicesArray.Add(deviceObj);
                     }
-                    var keyMapJson = new JObject();
-                    foreach (var pair in _keyMap) { keyMapJson.Add(pair.Key, pair.Value); }
-                    var response = new JObject { ["devices"] = devicesArray, ["key_map"] = keyMapJson };
+
+                    var response = new JObject { ["devices"] = devicesArray };
                     byte[] dataBytes = Encoding.UTF8.GetBytes(response.ToString(Formatting.None));
                     int networkOrderLength = IPAddress.HostToNetworkOrder(dataBytes.Length);
                     byte[] lengthBytes = BitConverter.GetBytes(networkOrderLength);
