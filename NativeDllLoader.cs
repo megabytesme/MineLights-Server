@@ -23,20 +23,55 @@ public static class NativeDllLoader
             Console.WriteLine($"[Loader] Using temporary path for native libs: {tempPath}");
             Directory.CreateDirectory(tempPath);
 
-            LoadSdk("Corsair", "MineLights.resources.x64.iCUESDK.x64_2019.dll", "iCUESDK.x64_2019.dll", tempPath, CorsairDeviceProvider.PossibleX64NativePaths);
-            LoadSdk("MSI", "MineLights.resources.x64.MysticLight_SDK_x64.dll", "MysticLight_SDK_x64.dll", tempPath, MsiDeviceProvider.PossibleX64NativePaths);
-            LoadSdk("Logitech", "MineLights.resources.x64.LogitechLedEnginesWrapper.dll", "LogitechLedEnginesWrapper.dll", tempPath, LogitechDeviceProvider.PossibleX64NativePaths);
-            LoadSdk("Wooting", "MineLights.resources.x64.wooting-rgb-sdk.dll", "wooting-rgb-sdk.dll", tempPath, WootingDeviceProvider.PossibleX64NativePathsWindows);
+            LoadSdk(
+                "Corsair",
+                "MineLights.resources.x64.iCUESDK.x64_2019.dll",
+                "iCUESDK.x64_2019.dll",
+                tempPath,
+                CorsairDeviceProvider.PossibleX64NativePaths
+            );
+            LoadSdk(
+                "MSI",
+                "MineLights.resources.x64.MysticLight_SDK_x64.dll",
+                "MysticLight_SDK_x64.dll",
+                tempPath,
+                MsiDeviceProvider.PossibleX64NativePaths
+            );
+            LoadSdk(
+                "Logitech",
+                "MineLights.resources.x64.LogitechLedEnginesWrapper.dll",
+                "LogitechLedEnginesWrapper.dll",
+                tempPath,
+                LogitechDeviceProvider.PossibleX64NativePaths
+            );
+            LoadSdk(
+                "Wooting",
+                "MineLights.resources.x64.wooting-rgb-sdk.dll",
+                "wooting-rgb-sdk.dll",
+                tempPath,
+                WootingDeviceProvider.PossibleX64NativePathsWindows
+            );
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[Loader] FATAL ERROR: {ex.Message}");
-            MessageBox.Show($"A critical error occurred while loading native libraries:\n\n{ex.Message}\n\nThe application will now exit.", "MineLights Server Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(
+                $"A critical error occurred while loading native libraries:\n\n{ex.Message}\n\nThe application will now exit.",
+                "MineLights Server Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
             Environment.Exit(1);
         }
     }
 
-    private static void LoadSdk(string name, string resourceName, string outputFileName, string tempPath, ICollection<string> possiblePaths)
+    private static void LoadSdk(
+        string name,
+        string resourceName,
+        string outputFileName,
+        string tempPath,
+        ICollection<string> possiblePaths
+    )
     {
         Console.WriteLine($"[Loader] Preparing {name} SDK...");
         string dllPath = Path.Combine(tempPath, outputFileName);
@@ -47,12 +82,14 @@ public static class NativeDllLoader
 
     private static void ExtractResource(string resourceName, string outputPath)
     {
-        if (File.Exists(outputPath)) return;
+        if (File.Exists(outputPath))
+            return;
 
         Assembly assembly = Assembly.GetExecutingAssembly();
         using (Stream? stream = assembly.GetManifestResourceStream(resourceName))
         {
-            if (stream == null) throw new FileNotFoundException($"Cannot find embedded resource: {resourceName}.");
+            if (stream == null)
+                throw new FileNotFoundException($"Cannot find embedded resource: {resourceName}.");
 
             using (FileStream fileStream = new FileStream(outputPath, FileMode.Create))
             {

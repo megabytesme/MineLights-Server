@@ -13,7 +13,12 @@ class Program
 
         if (!mutex.WaitOne(TimeSpan.Zero, true))
         {
-            MessageBox.Show("MineLights Server is already running.", "MineLights", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(
+                "MineLights Server is already running.",
+                "MineLights",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
             return;
         }
 
@@ -38,15 +43,18 @@ public class MyAppContext : ApplicationContext
         lightingServer = new LightingServer(Shutdown);
         lightingServer.Start();
 
-        var iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MineLights.resources.app_icon.ico");
-        if (iconStream == null) throw new FileNotFoundException("Tray icon resource not found.");
+        var iconStream = Assembly
+            .GetExecutingAssembly()
+            .GetManifestResourceStream("MineLights.resources.app_icon.ico");
+        if (iconStream == null)
+            throw new FileNotFoundException("Tray icon resource not found.");
 
         trayIcon = new NotifyIcon()
         {
             Icon = new Icon(iconStream),
             Text = "MineLights Server",
             ContextMenuStrip = new ContextMenuStrip(),
-            Visible = true
+            Visible = true,
         };
 
         trayIcon.ContextMenuStrip.Items.Add("View Logs", null, OnViewLogs);
@@ -65,12 +73,22 @@ public class MyAppContext : ApplicationContext
             }
             else
             {
-                MessageBox.Show("Log file not found.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(
+                    "Log file not found.",
+                    "Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
             }
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Could not open log file.\n\nError: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(
+                $"Could not open log file.\n\nError: {ex.Message}",
+                "Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
         }
     }
 

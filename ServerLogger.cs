@@ -2,7 +2,9 @@
 
 public sealed class ServerLogger : TextWriter
 {
-    private static readonly Lazy<ServerLogger> _instance = new Lazy<ServerLogger>(() => new ServerLogger());
+    private static readonly Lazy<ServerLogger> _instance = new Lazy<ServerLogger>(() =>
+        new ServerLogger()
+    );
     public static ServerLogger Instance => _instance.Value;
 
     private readonly StreamWriter _fileWriter;
@@ -22,7 +24,10 @@ public sealed class ServerLogger : TextWriter
             Directory.CreateDirectory(logDirectory);
             _logFilePath = Path.Combine(logDirectory, "server.log");
 
-            _fileWriter = new StreamWriter(_logFilePath, append: true, Encoding.UTF8) { AutoFlush = true };
+            _fileWriter = new StreamWriter(_logFilePath, append: true, Encoding.UTF8)
+            {
+                AutoFlush = true,
+            };
 
             Log("----------------------------------------------------------");
             Log($"Log session started at {DateTime.Now:F}");

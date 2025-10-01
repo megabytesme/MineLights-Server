@@ -20,7 +20,10 @@ public class LightingServer
     private volatile bool _isRunning = false;
     private readonly RGBSurface _surface;
     private readonly Dictionary<int, Led> _ledIdMap = new Dictionary<int, Led>();
-    private Thread? _handshakeThread, _udpListenerThread, _commandListenerThread, _discoveryThread;
+    private Thread? _handshakeThread,
+        _udpListenerThread,
+        _commandListenerThread,
+        _discoveryThread;
     private readonly Action _shutdownAction;
     private readonly object _deviceLock = new object();
 
@@ -37,11 +40,15 @@ public class LightingServer
 
         _allProviders = new List<IRGBDeviceProvider>
         {
-            MsiDeviceProvider.Instance, CorsairDeviceProvider.Instance,
-            LogitechDeviceProvider.Instance, AsusDeviceProvider.Instance,
-            RazerDeviceProvider.Instance, WootingDeviceProvider.Instance,
-            SteelSeriesDeviceProvider.Instance, NovationDeviceProvider.Instance,
-            PicoPiDeviceProvider.Instance
+            MsiDeviceProvider.Instance,
+            CorsairDeviceProvider.Instance,
+            LogitechDeviceProvider.Instance,
+            AsusDeviceProvider.Instance,
+            RazerDeviceProvider.Instance,
+            WootingDeviceProvider.Instance,
+            SteelSeriesDeviceProvider.Instance,
+            NovationDeviceProvider.Instance,
+            PicoPiDeviceProvider.Instance,
         };
 
         _config = LoadConfig();
@@ -55,15 +62,21 @@ public class LightingServer
             {
                 Console.WriteLine($"[Config] Loading configuration from {_configPath}");
                 string json = File.ReadAllText(_configPath);
-                var config = JsonConvert.DeserializeObject<ServerConfig>(json) ?? new ServerConfig();
+                var config =
+                    JsonConvert.DeserializeObject<ServerConfig>(json) ?? new ServerConfig();
 
                 if (config.EnabledIntegrations == null || !config.EnabledIntegrations.Any())
                 {
                     Console.WriteLine("[Config] No integrations specified, enabling defaults.");
                     config.EnabledIntegrations = new List<string>
                     {
-                        "Corsair", "Logitech", "Asus", "Razer",
-                        "Wooting", "SteelSeries", "Msi"
+                        "Corsair",
+                        "Logitech",
+                        "Asus",
+                        "Razer",
+                        "Wooting",
+                        "SteelSeries",
+                        "Msi",
                     };
                 }
                 return config;
@@ -71,7 +84,9 @@ public class LightingServer
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Config] Error loading config, using defaults. Error: {ex.Message}");
+            Console.WriteLine(
+                $"[Config] Error loading config, using defaults. Error: {ex.Message}"
+            );
         }
 
         Console.WriteLine("[Config] No config file found, creating a default one.");
@@ -79,9 +94,14 @@ public class LightingServer
         {
             EnabledIntegrations = new List<string>
             {
-                "Corsair", "Logitech", "Asus", "Razer",
-                "Wooting", "SteelSeries", "Msi"
-            }
+                "Corsair",
+                "Logitech",
+                "Asus",
+                "Razer",
+                "Wooting",
+                "SteelSeries",
+                "Msi",
+            },
         };
     }
 
@@ -93,7 +113,10 @@ public class LightingServer
             File.WriteAllText(_configPath, json);
             Console.WriteLine($"[Config] Configuration saved to {_configPath}");
         }
-        catch (Exception ex) { Console.WriteLine($"[Config] Error saving config: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Config] Error saving config: {ex.Message}");
+        }
     }
 
     public void Start()
@@ -146,7 +169,9 @@ public class LightingServer
                 {
                     if (provider is MsiDeviceProvider && !IsRunningAsAdmin())
                     {
-                        Console.WriteLine($"[Server] -> Skipping {providerName}: Not running as admin.");
+                        Console.WriteLine(
+                            $"[Server] -> Skipping {providerName}: Not running as admin."
+                        );
                         continue;
                     }
                     try
@@ -156,7 +181,9 @@ public class LightingServer
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[Server] -> WARNING: Initializing {providerName} failed. Details: {ex.ToString()}");
+                        Console.WriteLine(
+                            $"[Server] -> WARNING: Initializing {providerName} failed. Details: {ex.ToString()}"
+                        );
                     }
                 }
                 else if (!shouldBeEnabled && provider.IsInitialized)
@@ -169,7 +196,11 @@ public class LightingServer
             var devicesToAttach = _allProviders
                 .Where(p => p.IsInitialized)
                 .SelectMany(p => p.Devices)
-                .Where(d => !_config.DisabledDevices.Contains($"{d.DeviceInfo.Manufacturer}|{d.DeviceInfo.Model}"))
+                .Where(d =>
+                    !_config.DisabledDevices.Contains(
+                        $"{d.DeviceInfo.Manufacturer}|{d.DeviceInfo.Model}"
+                    )
+                )
                 .ToList();
 
             if (devicesToAttach.Any())
@@ -214,15 +245,23 @@ public class LightingServer
                 string clientConfigJson = Encoding.UTF8.GetString(clientConfigBytes);
                 JObject clientConfig = JObject.Parse(clientConfigJson);
 
-                _config.EnabledIntegrations = clientConfig["enabled_integrations"]?.ToObject<List<string>>() ?? _config.EnabledIntegrations;
-                _config.DisabledDevices = clientConfig["disabled_devices"]?.ToObject<List<string>>() ?? _config.DisabledDevices;
+                _config.EnabledIntegrations =
+                    clientConfig["enabled_integrations"]?.ToObject<List<string>>()
+                    ?? _config.EnabledIntegrations;
+                _config.DisabledDevices =
+                    clientConfig["disabled_devices"]?.ToObject<List<string>>()
+                    ?? _config.DisabledDevices;
                 SaveConfig();
                 ReconfigureSurfaceFromConfig();
 
                 lock (_deviceLock)
                 {
                     var devicesArray = new JArray();
-                    foreach (var device in _surface.Devices.OrderBy(d => d.DeviceInfo.DeviceType).ThenBy(d => d.DeviceInfo.Model))
+                    foreach (
+                        var device in _surface
+                            .Devices.OrderBy(d => d.DeviceInfo.DeviceType)
+                            .ThenBy(d => d.DeviceInfo.Model)
+                    )
                     {
                         var deviceKeyMap = new JObject();
                         var deviceLeds = new List<int>();
@@ -230,7 +269,8 @@ public class LightingServer
                         foreach (var led in device)
                         {
                             var mapping = _ledIdMap.FirstOrDefault(x => x.Value == led);
-                            if (mapping.Value == null) continue;
+                            if (mapping.Value == null)
+                                continue;
                             int ledId = mapping.Key;
                             deviceLeds.Add(ledId);
 
@@ -246,14 +286,15 @@ public class LightingServer
                             }
                         }
 
-                        if (!deviceLeds.Any()) continue;
+                        if (!deviceLeds.Any())
+                            continue;
 
                         var deviceObj = new JObject
                         {
                             ["sdk"] = device.DeviceInfo.Manufacturer,
                             ["name"] = device.DeviceInfo.Model,
                             ["leds"] = new JArray(deviceLeds),
-                            ["key_map"] = deviceKeyMap
+                            ["key_map"] = deviceKeyMap,
                         };
                         devicesArray.Add(deviceObj);
                     }
@@ -270,7 +311,10 @@ public class LightingServer
             }
         }
         catch (SocketException) { }
-        finally { listener.Stop(); }
+        finally
+        {
+            listener.Stop();
+        }
     }
 
     private void UdpServerLoop()
@@ -302,10 +346,7 @@ public class LightingServer
                     _surface.Update();
                 }
             }
-            catch
-            {
-
-            }
+            catch { }
         }
     }
 
@@ -325,16 +366,19 @@ public class LightingServer
                 int bytesRead = stream.Read(buffer, 0, buffer.Length);
                 string command = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
-                if (command == "restart_admin") TriggerRestart(true);
-                else if (command == "restart") TriggerRestart(false);
-                else if (command == "shutdown") _shutdownAction?.Invoke();
+                if (command == "restart_admin")
+                    TriggerRestart(true);
+                else if (command == "restart")
+                    TriggerRestart(false);
+                else if (command == "shutdown")
+                    _shutdownAction?.Invoke();
             }
         }
-        catch (SocketException)
+        catch (SocketException) { }
+        finally
         {
-
+            listener.Stop();
         }
-        finally { listener.Stop(); }
     }
 
     private void DiscoveryBroadcastLoop()
@@ -350,7 +394,10 @@ public class LightingServer
                 client.Send(message, message.Length, endpoint);
                 Thread.Sleep(5000);
             }
-            catch (SocketException) { break; }
+            catch (SocketException)
+            {
+                break;
+            }
         }
     }
 
@@ -358,10 +405,19 @@ public class LightingServer
     {
         try
         {
-            Process.Start(new ProcessStartInfo(Application.ExecutablePath) { UseShellExecute = true, Verb = asAdmin ? "runas" : "open" });
+            Process.Start(
+                new ProcessStartInfo(Application.ExecutablePath)
+                {
+                    UseShellExecute = true,
+                    Verb = asAdmin ? "runas" : "open",
+                }
+            );
             _shutdownAction?.Invoke();
         }
-        catch (Exception ex) { Console.WriteLine($"[Restart ERROR] {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Restart ERROR] {ex.Message}");
+        }
     }
 
     private bool IsRunningAsAdmin()
@@ -372,6 +428,9 @@ public class LightingServer
             var principal = new System.Security.Principal.WindowsPrincipal(identity);
             return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         }
-        catch { return false; }
+        catch
+        {
+            return false;
+        }
     }
 }
