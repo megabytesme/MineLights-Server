@@ -31,7 +31,6 @@ public class LightingServer
 
     private readonly RGBSurface _surface;
     private readonly Dictionary<int, Led> _ledIdMap = new();
-    private readonly Action _shutdownAction;
     private readonly object _deviceLock = new object();
 
     private ServerConfig _config;
@@ -39,9 +38,8 @@ public class LightingServer
 
     private readonly List<IRGBDeviceProvider> _allProviders;
 
-    public LightingServer(Action shutdownAction)
+    public LightingServer()
     {
-        _shutdownAction = shutdownAction;
         _surface = new RGBSurface();
         _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
@@ -504,7 +502,7 @@ public class LightingServer
                 else if (string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase))
                     Program.RequestRestart(false);
                 else if (string.Equals(command, "shutdown", StringComparison.OrdinalIgnoreCase))
-                    _shutdownAction?.Invoke();
+                    Program.RequestShutdown();
             }
         }
         catch (ObjectDisposedException) { }

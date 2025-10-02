@@ -83,6 +83,11 @@ static class Program
         Application.Exit();
     }
 
+    public static void RequestShutdown()
+    {
+        Application.Exit();
+    }
+
     public static bool IsRunningAsAdmin()
     {
         try
@@ -105,7 +110,7 @@ public class MyAppContext : ApplicationContext
 
     public MyAppContext()
     {
-        lightingServer = new LightingServer(Shutdown);
+        lightingServer = new LightingServer();
         lightingServer.Start();
 
         var iconStream = Assembly
@@ -169,26 +174,7 @@ public class MyAppContext : ApplicationContext
 
     private void Shutdown()
     {
-        if (trayIcon?.ContextMenuStrip?.InvokeRequired ?? false)
-        {
-            trayIcon.ContextMenuStrip.Invoke(new MethodInvoker(Shutdown));
-            return;
-        }
-
-        try
-        {
-            lightingServer.Stop();
-        }
-        catch { }
-
-        try
-        {
-            trayIcon.Visible = false;
-            trayIcon.Dispose();
-        }
-        catch { }
-
-        Application.ExitThread();
+        Application.Exit();
     }
 
     private void OnExit(object? sender, EventArgs e) => Shutdown();
