@@ -44,21 +44,23 @@ public class LightingServer
 
     public LightingServer()
     {
+        CorsairDeviceProvider.ExclusiveAccess = true;
+
         _surface = new RGBSurface();
         _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         _allProviders = new List<IRGBDeviceProvider>
-        {
-            MsiDeviceProvider.Instance,
-            CorsairDeviceProvider.Instance,
-            LogitechDeviceProvider.Instance,
-            AsusDeviceProvider.Instance,
-            RazerDeviceProvider.Instance,
-            WootingDeviceProvider.Instance,
-            SteelSeriesDeviceProvider.Instance,
-            NovationDeviceProvider.Instance,
-            PicoPiDeviceProvider.Instance,
-        };
+    {
+        MsiDeviceProvider.Instance,
+        CorsairDeviceProvider.Instance,
+        LogitechDeviceProvider.Instance,
+        AsusDeviceProvider.Instance,
+        RazerDeviceProvider.Instance,
+        WootingDeviceProvider.Instance,
+        SteelSeriesDeviceProvider.Instance,
+        NovationDeviceProvider.Instance,
+        PicoPiDeviceProvider.Instance,
+    };
 
         _config = LoadConfig();
     }
