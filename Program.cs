@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using Newtonsoft.Json;
+using System.Diagnostics;
 using System.Reflection;
 using System.Security.Principal;
 using MethodInvoker = System.Windows.Forms.MethodInvoker;
@@ -143,7 +144,50 @@ public class MyAppContext : ApplicationContext
             );
         }
         trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+        var supportMenu = new ToolStripMenuItem("Support");
+        supportMenu.DropDownItems.Add("Create Device Snapshot", null, OnCreateSnapshot);
+        trayIcon.ContextMenuStrip.Items.Add(supportMenu);
+        trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         trayIcon.ContextMenuStrip.Items.Add("Exit", null, OnExit);
+    }
+
+    private void OnCreateSnapshot(object? sender, EventArgs e)
+    {
+        try
+        {
+            using var sfd = new SaveFileDialog
+            {
+                Title = "Save MineLights Device Snapshot",
+                Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*",
+                FileName = $"minelights_snapshot_{DateTime.Now:yyyyMMdd_HHmmss}.json",
+                InitialDirectory = AppDomain.CurrentDomain.BaseDirectory
+            };
+
+            if (sfd.ShowDialog() != DialogResult.OK)
+                return;
+
+            var snapshot = lightingServer.BuildRawSnapshot();
+
+            string json = JsonConvert.SerializeObject(snapshot, Formatting.Indented);
+
+            File.WriteAllText(sfd.FileName, json);
+
+            MessageBox.Show(
+                "Device snapshot created successfully.",
+                "MineLights Support",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Failed to create device snapshot.\n\nError: {ex.Message}",
+                "MineLights Support",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
     }
 
     private void OnViewLogs(object? sender, EventArgs e)

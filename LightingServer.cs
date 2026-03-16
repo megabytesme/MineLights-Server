@@ -59,6 +59,97 @@ public class LightingServer
         _config = LoadConfig();
     }
 
+    public RawSnapshotFile BuildRawSnapshot()
+    {
+        lock (_deviceLock)
+        {
+            var snapshot = new RawSnapshotFile();
+
+            foreach (var device in _surface.Devices)
+            {
+                var dev = new RawDeviceSnapshot
+                {
+                    Manufacturer = device.DeviceInfo.Manufacturer,
+                    Model = device.DeviceInfo.Model,
+                    DeviceType = device.DeviceInfo.DeviceType.ToString(),
+                    DeviceName = device.DeviceInfo.DeviceName
+                };
+
+                foreach (var led in device)
+                {
+                    var abs = led.AbsoluteBoundary;
+
+                    dev.Leds.Add(new RawLedSnapshot
+                    {
+                        LedId = led.Id.ToString(),
+
+                        A = led.Color.A,
+                        R = led.Color.R,
+                        G = led.Color.G,
+                        B = led.Color.B,
+
+                        LocationX = led.Location.X,
+                        LocationY = led.Location.Y,
+
+                        SizeWidth = led.Size.Width,
+                        SizeHeight = led.Size.Height,
+
+                        AbsX = abs.Location.X,
+                        AbsY = abs.Location.Y,
+                        AbsWidth = abs.Size.Width,
+                        AbsHeight = abs.Size.Height,
+
+                        Shape = led.Shape.ToString(),
+                        ShapeData = led.ShapeData
+                    });
+                }
+
+                snapshot.Devices.Add(dev);
+            }
+
+            return snapshot;
+        }
+    }
+
+    public class RawSnapshotFile
+    {
+        public List<RawDeviceSnapshot> Devices { get; set; } = new();
+    }
+
+    public class RawDeviceSnapshot
+    {
+        public string Manufacturer { get; set; }
+        public string Model { get; set; }
+        public string DeviceType { get; set; }
+        public string DeviceName { get; set; }
+
+        public List<RawLedSnapshot> Leds { get; set; } = new();
+    }
+
+    public class RawLedSnapshot
+    {
+        public string LedId { get; set; }
+
+        public float A { get; set; }
+        public float R { get; set; }
+        public float G { get; set; }
+        public float B { get; set; }
+
+        public float LocationX { get; set; }
+        public float LocationY { get; set; }
+
+        public float SizeWidth { get; set; }
+        public float SizeHeight { get; set; }
+
+        public float AbsX { get; set; }
+        public float AbsY { get; set; }
+        public float AbsWidth { get; set; }
+        public float AbsHeight { get; set; }
+
+        public string Shape { get; set; }
+        public string? ShapeData { get; set; }
+    }
+
     private ServerConfig LoadConfig()
     {
         try
