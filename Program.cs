@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using System.Security.Principal;
+using static LightingServer;
 using MethodInvoker = System.Windows.Forms.MethodInvoker;
 
 static class Program
@@ -146,9 +147,85 @@ public class MyAppContext : ApplicationContext
         trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         var supportMenu = new ToolStripMenuItem("Support");
         supportMenu.DropDownItems.Add("Create Device Snapshot", null, OnCreateSnapshot);
+        var emulationMenu = new ToolStripMenuItem("Emulation");
+        emulationMenu.DropDownItems.Add("Load Device Snapshot…", null, OnLoadSnapshot);
+        emulationMenu.DropDownItems.Add("Exit Emulation", null, OnExitEmulation);
+        supportMenu.DropDownItems.Add(emulationMenu);
         trayIcon.ContextMenuStrip.Items.Add(supportMenu);
         trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         trayIcon.ContextMenuStrip.Items.Add("Exit", null, OnExit);
+    }
+
+    private void OnExitEmulation(object? sender, EventArgs e)
+    {
+        try
+        {
+            lightingServer.ExitEmulation();
+
+            MessageBox.Show(
+                "Emulation mode exited. Real hardware restored.",
+                "MineLights",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Failed to exit emulation.\n\n{ex.Message}",
+                "MineLights",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
+    }
+
+    private void OnLoadSnapshot(object? sender, EventArgs e)
+    {
+        try
+        {
+            using var ofd = new OpenFileDialog
+            {
+                Title = "Load MineLights Device Snapshot",
+                Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*",
+                InitialDirectory = AppDomain.CurrentDomain.BaseDirectory
+            };
+
+            if (ofd.ShowDialog() != DialogResult.OK)
+                return;
+
+            string json = File.ReadAllText(ofd.FileName);
+            var snapshot = JsonConvert.DeserializeObject<RawSnapshotFile>(json);
+
+            if (snapshot == null)
+            {
+                MessageBox.Show(
+                    "Invalid snapshot file.",
+                    "MineLights",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+                return;
+            }
+
+            lightingServer.LoadSnapshotForEmulation(snapshot);
+
+            MessageBox.Show(
+                "Snapshot loaded. Emulation mode active.",
+                "MineLights",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Failed to load snapshot.\n\n{ex.Message}",
+                "MineLights",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
     }
 
     private void OnCreateSnapshot(object? sender, EventArgs e)
@@ -174,7 +251,7 @@ public class MyAppContext : ApplicationContext
 
             MessageBox.Show(
                 "Device snapshot created successfully.",
-                "MineLights Support",
+                "MineLights",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information
             );
@@ -183,7 +260,7 @@ public class MyAppContext : ApplicationContext
         {
             MessageBox.Show(
                 $"Failed to create device snapshot.\n\nError: {ex.Message}",
-                "MineLights Support",
+                "MineLights",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error
             );

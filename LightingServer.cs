@@ -38,6 +38,10 @@ public class LightingServer
 
     private readonly List<IRGBDeviceProvider> _allProviders;
 
+    private bool _isEmulationMode = false;
+    private List<EmulatedDevice>? _emulatedDevices;
+    private Dictionary<int, EmulatedLed>? _emulatedLedMap;
+
     public LightingServer()
     {
         _surface = new RGBSurface();
@@ -148,6 +152,99 @@ public class LightingServer
 
         public string Shape { get; set; }
         public string? ShapeData { get; set; }
+    }
+
+    public void LoadSnapshotForEmulation(RawSnapshotFile snapshot)
+    {
+        lock (_deviceLock)
+        {
+            _isEmulationMode = true;
+
+            _emulatedDevices = snapshot.Devices
+                .Select(d => new EmulatedDevice
+                {
+                    Manufacturer = d.Manufacturer,
+                    Model = d.Model,
+                    DeviceType = d.DeviceType,
+                    DeviceName = d.DeviceName,
+                    Leds = d.Leds.Select(l => new EmulatedLed
+                    {
+                        LedId = l.LedId,
+                        A = l.A,
+                        R = l.R,
+                        G = l.G,
+                        B = l.B,
+                        LocationX = l.LocationX,
+                        LocationY = l.LocationY,
+                        SizeWidth = l.SizeWidth,
+                        SizeHeight = l.SizeHeight,
+                        AbsX = l.AbsX,
+                        AbsY = l.AbsY,
+                        AbsWidth = l.AbsWidth,
+                        AbsHeight = l.AbsHeight,
+                        Shape = l.Shape,
+                        ShapeData = l.ShapeData
+                    }).ToList()
+                })
+                .ToList();
+
+            _emulatedLedMap = new Dictionary<int, EmulatedLed>();
+            int id = 0;
+            foreach (var dev in _emulatedDevices)
+                foreach (var led in dev.Leds)
+                    _emulatedLedMap[id++] = led;
+
+            Console.WriteLine("[Emulation] Snapshot loaded. Emulation mode active.");
+        }
+    }
+
+    public class EmulatedDevice
+    {
+        public string Manufacturer { get; set; }
+        public string Model { get; set; }
+        public string DeviceType { get; set; }
+        public string DeviceName { get; set; }
+
+        public List<EmulatedLed> Leds { get; set; } = new();
+    }
+
+    public class EmulatedLed
+    {
+        public string LedId { get; set; }
+        public float A { get; set; }
+        public float R { get; set; }
+        public float G { get; set; }
+        public float B { get; set; }
+
+        public float LocationX { get; set; }
+        public float LocationY { get; set; }
+        public float SizeWidth { get; set; }
+        public float SizeHeight { get; set; }
+
+        public float AbsX { get; set; }
+        public float AbsY { get; set; }
+        public float AbsWidth { get; set; }
+        public float AbsHeight { get; set; }
+
+        public string Shape { get; set; }
+        public string? ShapeData { get; set; }
+    }
+
+    public void ExitEmulation()
+    {
+        lock (_deviceLock)
+        {
+            if (!_isEmulationMode)
+                return;
+
+            _isEmulationMode = false;
+            _emulatedDevices = null;
+            _emulatedLedMap = null;
+
+            ReconfigureSurfaceFromConfig();
+
+            Console.WriteLine("[Emulation] Emulation mode exited. Real hardware restored.");
+        }
     }
 
     private ServerConfig LoadConfig()
@@ -451,43 +548,80 @@ public class LightingServer
 
                 lock (_deviceLock)
                 {
-                    var devicesArray = new JArray();
-                    foreach (
-                        var device in _surface
-                            .Devices.OrderBy(d => d.DeviceInfo.DeviceType)
-                            .ThenBy(d => d.DeviceInfo.Model)
-                    )
+                    JArray devicesArray;
+
+                    lock (_deviceLock)
                     {
-                        var deviceKeyMap = new JObject();
-                        var deviceLeds = new List<int>();
-
-                        foreach (var led in device)
+                        if (_isEmulationMode && _emulatedDevices != null)
                         {
-                            var mapping = _ledIdMap.FirstOrDefault(x => x.Value == led);
-                            if (mapping.Value == null)
-                                continue;
-                            int ledId = mapping.Key;
-                            deviceLeds.Add(ledId);
+                            devicesArray = new JArray();
 
-                            string? keyName = KeyMapper.GetFriendlyName(led.Id);
-                            if (keyName == null)
-                                keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
+                            foreach (var dev in _emulatedDevices)
+                            {
+                                var deviceKeyMap = new JObject();
+                                var deviceLeds = new List<int>();
 
-                            if (!deviceKeyMap.ContainsKey(keyName))
-                                deviceKeyMap.Add(keyName, ledId);
+                                foreach (var led in dev.Leds)
+                                {
+                                    int ledId = _emulatedLedMap!.First(x => x.Value == led).Key;
+                                    deviceLeds.Add(ledId);
+
+                                    string keyName = led.LedId.ToUpper();
+                                    if (!deviceKeyMap.ContainsKey(keyName))
+                                        deviceKeyMap.Add(keyName, ledId);
+                                }
+
+                                devicesArray.Add(new JObject
+                                {
+                                    ["sdk"] = dev.Manufacturer,
+                                    ["name"] = dev.Model,
+                                    ["leds"] = new JArray(deviceLeds),
+                                    ["key_map"] = deviceKeyMap
+                                });
+                            }
                         }
-
-                        if (!deviceLeds.Any())
-                            continue;
-
-                        var deviceObj = new JObject
+                        else
                         {
-                            ["sdk"] = device.DeviceInfo.Manufacturer,
-                            ["name"] = device.DeviceInfo.Model,
-                            ["leds"] = new JArray(deviceLeds),
-                            ["key_map"] = deviceKeyMap,
-                        };
-                        devicesArray.Add(deviceObj);
+                            devicesArray = new JArray();
+
+                            foreach (
+                                var device in _surface
+                                    .Devices.OrderBy(d => d.DeviceInfo.DeviceType)
+                                    .ThenBy(d => d.DeviceInfo.Model)
+                            )
+                            {
+                                var deviceKeyMap = new JObject();
+                                var deviceLeds = new List<int>();
+
+                                foreach (var led in device)
+                                {
+                                    var mapping = _ledIdMap.FirstOrDefault(x => x.Value == led);
+                                    if (mapping.Value == null)
+                                        continue;
+                                    int ledId = mapping.Key;
+                                    deviceLeds.Add(ledId);
+
+                                    string? keyName = KeyMapper.GetFriendlyName(led.Id);
+                                    if (keyName == null)
+                                        keyName = led.Id.ToString().ToUpper().Replace("KEYBOARD_", "");
+
+                                    if (!deviceKeyMap.ContainsKey(keyName))
+                                        deviceKeyMap.Add(keyName, ledId);
+                                }
+
+                                if (!deviceLeds.Any())
+                                    continue;
+
+                                var deviceObj = new JObject
+                                {
+                                    ["sdk"] = device.DeviceInfo.Manufacturer,
+                                    ["name"] = device.DeviceInfo.Model,
+                                    ["leds"] = new JArray(deviceLeds),
+                                    ["key_map"] = deviceKeyMap,
+                                };
+                                devicesArray.Add(deviceObj);
+                            }
+                        }
                     }
 
                     var response = new JObject { ["devices"] = devicesArray };
@@ -545,10 +679,23 @@ public class LightingServer
                         int r = item.Value<int>("r");
                         int g = item.Value<int>("g");
                         int b = item.Value<int>("b");
-                        if (_ledIdMap.TryGetValue(id, out Led led))
-                            led.Color = new RGB.NET.Core.Color((byte)r, (byte)g, (byte)b);
+                        if (_isEmulationMode)
+                        {
+                            if (_emulatedLedMap != null && _emulatedLedMap.TryGetValue(id, out var emu))
+                            {
+                                emu.R = r / 255f;
+                                emu.G = g / 255f;
+                                emu.B = b / 255f;
+                            }
+                        }
+                        else
+                        {
+                            if (_ledIdMap.TryGetValue(id, out Led led))
+                                led.Color = new RGB.NET.Core.Color((byte)r, (byte)g, (byte)b);
+
+                            _surface.Update();
+                        }
                     }
-                    _surface.Update();
                 }
             }
         }
