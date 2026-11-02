@@ -45,6 +45,7 @@ public class LightingServer
     public LightingServer()
     {
         CorsairDeviceProvider.ExclusiveAccess = true;
+        DeviceDefinitions.Register();
 
         _surface = new RGBSurface();
         _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");

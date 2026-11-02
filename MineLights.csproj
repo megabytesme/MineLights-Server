@@ -7,7 +7,9 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>resources\app_icon.ico</ApplicationIcon>
-    <AssemblyVersion>2.3.3</AssemblyVersion>
+    <Version>2.3.4</Version>
+    <AssemblyVersion>2.3.4.0</AssemblyVersion>
+    <FileVersion>2.3.4.0</FileVersion>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
@@ -46,15 +48,21 @@
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
-    <PackageReference Include="RGB.NET.Core" Version="3.1.0" />
-    <PackageReference Include="RGB.NET.Devices.Corsair" Version="3.1.0" />
-    <PackageReference Include="RGB.NET.Devices.Logitech" Version="3.1.0" />
-    <PackageReference Include="RGB.NET.Devices.Msi" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.Asus" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.Razer" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.Wooting" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.SteelSeries" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.Novation" Version="3.1.0" />
-	<PackageReference Include="RGB.NET.Devices.PicoPi" Version="3.1.0" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Core\RGB.NET.Core.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Corsair\RGB.NET.Devices.Corsair.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Logitech\RGB.NET.Devices.Logitech.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Msi\RGB.NET.Devices.Msi.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Asus\RGB.NET.Devices.Asus.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Razer\RGB.NET.Devices.Razer.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Wooting\RGB.NET.Devices.Wooting.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.SteelSeries\RGB.NET.Devices.SteelSeries.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.Novation\RGB.NET.Devices.Novation.csproj" />
+    <ProjectReference Include="third_party\RGB.NET\RGB.NET.Devices.PicoPi\RGB.NET.Devices.PicoPi.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="third_party\**\*;tests\**\*" />
+    <EmbeddedResource Remove="third_party\**\*;tests\**\*" />
+    <None Remove="third_party\**\*;tests\**\*" />
   </ItemGroup>
 </Project>

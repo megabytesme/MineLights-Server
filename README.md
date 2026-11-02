@@ -24,7 +24,15 @@ MineLights Server is a .NET app with modular design to support a wide range of h
 - **Novation**: Support for Novation MIDI controllers like the Launchpad, enabling unique grid-based effects (Windows).
 - **Raspberry Pi Pico**: Directly control custom DIY lighting projects powered by a Raspberry Pi Pico (Windows).
 
-### This project uses the RGB.Net Nuget package.
+### Building from source
+
+The RGB.NET source is pinned as a Git submodule. Clone with `git clone --recursive`, or run `git submodule update --init --recursive` after cloning, then build with the .NET 10 SDK:
+
+```powershell
+dotnet build MineLights.csproj -c Release -m /p:GeneratePackageOnBuild=false
+```
+
+RGB.NET is provided under its own licence in `third_party/RGB.NET/LICENSE`.
 
 ## 🛠️ Installation
 
