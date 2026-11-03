@@ -51,8 +51,9 @@ For the MineLights Server to function correctly, please ensure the following req
 
 #### Network
 
-*   **Local Network Access:** The client and the server (`MineLights.exe`) must be running on the same local network.
-*   **Firewall Configuration:** Ensure your firewall (e.g., Windows Defender Firewall) allows communication on the TCP/UDP ports listed above (`63211`, `63212`, `63213`, `63214`). A firewall prompt may appear on the first run of `MineLights.exe`; be sure to "Allow access".
+*   **Local Access:** Minecraft and MineLights Server (`MineLights.exe`) must run on the same computer. The server's handshake (TCP `63211`), lighting (UDP `63212`) and command (TCP `63213`) endpoints bind to `127.0.0.1`.
+*   **Discovery:** The server broadcasts `MINELIGHTS_PROXY_HELLO` on UDP `63214` every five seconds so the Minecraft client can detect that it is running. This discovery message is broadcast on the local network.
+*   **Firewall Configuration:** No inbound firewall rule is needed for the server endpoints on `63211`–`63213`, since they accept connections only from the same computer. If Windows asks, allow the Minecraft Java process to receive the UDP `63214` discovery message on private networks.
 
 ---
 
@@ -246,8 +247,8 @@ If you encounter issues, follow these steps:
     *   Verify that your device is not listed in the `DisabledDevices` section of `config.json`.
 
 4.  **No Connection Between Client and Server:**
-    *   Make sure both are running on the same computer or at least the same local network.
-    *   Check your firewall settings to ensure ports `63211-63214` are not being blocked.
+    *   Make sure Minecraft and `MineLights.exe` are running on the same computer.
+    *   If the server is running but MineLights does not connect, allow the Minecraft Java process to receive the UDP `63214` discovery message on private networks.
 
 
 ## Roadmap

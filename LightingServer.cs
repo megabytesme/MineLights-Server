@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Newtonsoft.Json;
@@ -325,13 +325,13 @@ public class LightingServer
 
         ReconfigureSurfaceFromConfig();
 
-        _handshakeListener = new TcpListener(IPAddress.Any, 63211);
+        _handshakeListener = new TcpListener(IPAddress.Loopback, 63211);
         _handshakeListener.Start();
 
-        _udpClient = new UdpClient(63212);
+        _udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 63212));
         Console.WriteLine("[Server] UDP lighting listener on port 63212.");
 
-        _commandListener = new TcpListener(IPAddress.Any, 63213);
+        _commandListener = new TcpListener(IPAddress.Loopback, 63213);
         _commandListener.Start();
         Console.WriteLine("[Server] Command server listening on port 63213.");
 
@@ -530,31 +530,41 @@ public class LightingServer
                 }
 
                 using var client = listener.AcceptTcpClient();
-                using var stream = client.GetStream();
-
-                var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
-                int clientConfigLength = IPAddress.NetworkToHostOrder(reader.ReadInt32());
-                byte[] clientConfigBytes = reader.ReadBytes(clientConfigLength);
-                string clientConfigJson = Encoding.UTF8.GetString(clientConfigBytes);
-                JObject clientConfig = JObject.Parse(clientConfigJson);
-
-                _config.EnabledIntegrations =
-                    clientConfig["enabled_integrations"]?.ToObject<List<string>>()
-                    ?? _config.EnabledIntegrations;
-
-                _config.DisabledDevices =
-                    clientConfig["disabled_devices"]?.ToObject<List<string>>()
-                    ?? _config.DisabledDevices;
-
-                SaveConfig();
-                ReconfigureSurfaceFromConfig();
-
-                lock (_deviceLock)
+                try
                 {
-                    JArray devicesArray;
+                    client.ReceiveTimeout = 5000;
+                    client.SendTimeout = 5000;
+                    using var stream = client.GetStream();
+                    using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+                    int clientConfigLength = IPAddress.NetworkToHostOrder(reader.ReadInt32());
+                    if (clientConfigLength <= 0 || clientConfigLength > 1_048_576)
+                    {
+                        Console.WriteLine("[Handshake] Ignoring client with an invalid config length.");
+                        continue;
+                    }
+
+                    byte[] clientConfigBytes = reader.ReadBytes(clientConfigLength);
+                    if (clientConfigBytes.Length != clientConfigLength)
+                        throw new EndOfStreamException("Client disconnected before sending its full config.");
+
+                    string clientConfigJson = Encoding.UTF8.GetString(clientConfigBytes);
+                    JObject clientConfig = JObject.Parse(clientConfigJson);
+
+                    _config.EnabledIntegrations =
+                        clientConfig["enabled_integrations"]?.ToObject<List<string>>()
+                        ?? _config.EnabledIntegrations;
+
+                    _config.DisabledDevices =
+                        clientConfig["disabled_devices"]?.ToObject<List<string>>()
+                        ?? _config.DisabledDevices;
+
+                    SaveConfig();
+                    ReconfigureSurfaceFromConfig();
 
                     lock (_deviceLock)
                     {
+                        JArray devicesArray;
+
                         if (_isEmulationMode && _emulatedDevices != null)
                         {
                             devicesArray = new JArray();
@@ -625,16 +635,32 @@ public class LightingServer
                                 devicesArray.Add(deviceObj);
                             }
                         }
-                    }
 
-                    var response = new JObject { ["devices"] = devicesArray };
-                    byte[] dataBytes = Encoding.UTF8.GetBytes(response.ToString(Formatting.None));
-                    int networkOrderLength = IPAddress.HostToNetworkOrder(dataBytes.Length);
-                    byte[] lengthBytes = BitConverter.GetBytes(networkOrderLength);
+                        var response = new JObject { ["devices"] = devicesArray };
+                        byte[] dataBytes = Encoding.UTF8.GetBytes(response.ToString(Formatting.None));
+                        int networkOrderLength = IPAddress.HostToNetworkOrder(dataBytes.Length);
+                        byte[] lengthBytes = BitConverter.GetBytes(networkOrderLength);
 
-                    stream.Write(lengthBytes, 0, 4);
-                    stream.Write(dataBytes, 0, dataBytes.Length);
-                    stream.Flush();
+                        stream.Write(lengthBytes, 0, 4);
+                        stream.Write(dataBytes, 0, dataBytes.Length);
+                        stream.Flush();
+                }
+                }
+                catch (IOException ex)
+                {
+                    Console.WriteLine($"[Handshake] Ignoring incomplete client handshake: {ex.Message}");
+                }
+                catch (SocketException ex)
+                {
+                    Console.WriteLine($"[Handshake] Ignoring disconnected client: {ex.Message}");
+                }
+                catch (JsonException ex)
+                {
+                    Console.WriteLine($"[Handshake] Ignoring invalid client config: {ex.Message}");
+                }
+                catch (ArgumentOutOfRangeException ex)
+                {
+                    Console.WriteLine($"[Handshake] Ignoring invalid client handshake: {ex.Message}");
                 }
             }
         }

@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>resources\app_icon.ico</ApplicationIcon>
-    <Version>2.3.4</Version>
-    <AssemblyVersion>2.3.4.0</AssemblyVersion>
-    <FileVersion>2.3.4.0</FileVersion>
+    <Version>2.3.5</Version>
+    <AssemblyVersion>2.3.5.0</AssemblyVersion>
+    <FileVersion>2.3.5.0</FileVersion>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
