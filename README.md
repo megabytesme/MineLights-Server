@@ -65,11 +65,178 @@ For the MineLights Server to function correctly, please ensure the following req
 
 ## Usage
 
-### V2 Connections
+### V2 endpoint
 
-V2 uses one TLS TCP session for authentication, device discovery, requests, and lighting frames. Local clients discover the endpoint through the protected `endpoint.json` file, then enroll with the local key after the user permits MineLights Server to run. The local port is chosen by the OS; the remote listener uses the port selected in the tray settings.
+V2 uses a single bidirectional **TLS TCP connection** for authentication, device discovery, requests, and lighting frames. It is a framed protocol, not an HTTP API: the JSON examples below are message payloads, not standalone TCP messages. The local port is chosen by the OS; there is no fixed V2 UDP port.
 
-The server tray menu provides owner controls for legacy V1 access, remote interface and port selection, pairing-file export, and revoking paired clients. Remote access is authenticated and requires an explicit one-time pairing file. An authenticated V2 client may request shutdown, which is refused if another authenticated session is connected or legacy access is enabled. Restart and configuration remain tray controls.
+#### 1. Discover and pair
+
+For a client running under the same Windows account as the server, read `%LOCALAPPDATA%\MineLights\v2\endpoint.json`:
+
+```json
+{
+  "schema_version": 1,
+  "server_id": "d2c4f8c0-973f-42c5-bcd8-74d7d34d33a2",
+  "server_name": "My-PC",
+  "host": "127.0.0.1",
+  "port": 49152,
+  "tls_certificate_sha256": "<64-character SHA-256 fingerprint>",
+  "protocol_major": 2,
+  "protocol_minor": 0
+}
+```
+
+Connect to its `host` and `port` with TLS 1.2 or newer and verify the SHA-256 fingerprint of the server's DER-encoded certificate against `tls_certificate_sha256`. For first-time local enrollment, read the separate 32-byte `local-enrollment.key` in the same protected directory. The client generates and securely stores its own UUID and 32-byte secret, authenticates using the enrollment key, registers its secret, and reconnects using that secret. Local enrollment is accepted only from loopback.
+
+For a remote client, enable **Server Connections → Remote access** in the tray, select the interfaces and port, then use **Export one-time pairing file**. Transfer the `.mlpair` file securely to the client. It contains the remote endpoint, certificate fingerprint, and a one-time pairing code that expires after five minutes. The client uses that code to enroll, then reconnects using its own stored secret. Remote access is off by default; configure any VPN or network routing separately.
+
+Keep the local enrollment key, pairing file, and client secrets private. The endpoint document is discovery data, not a credential. The tray can revoke individual paired clients.
+
+#### 2. Frame messages and authenticate
+
+Every message has a 16-byte, big-endian header followed by a UTF-8 JSON payload:
+
+| Offset | Bytes | Field |
+| --- | ---: | --- |
+| 0 | 4 | ASCII magic `MLV2` |
+| 4 | 2 | Protocol major (`2`) |
+| 6 | 2 | Protocol minor (`0`) |
+| 8 | 2 | Message type |
+| 10 | 2 | Flags (`0`) |
+| 12 | 4 | Payload length in bytes |
+
+Send `CLIENT_HELLO` (`0x0001`) first. For example, a lighting client requesting two providers sends:
+
+```json
+{
+  "client_id": "2ee8316a-cda0-4f2a-9f3d-25768269160e",
+  "app_id": "example-client",
+  "app_version": "1.0.0",
+  "min_minor": 0,
+  "max_minor": 0,
+  "capabilities": [],
+  "requested_integrations": ["Corsair", "Logitech"]
+}
+```
+
+The server replies with `SERVER_HELLO` (`0x0002`), including its ID, selected minor version, and a random nonce. Send `CLIENT_AUTH` (`0x0003`):
+
+```json
+{
+  "credential_type": "local_enrollment",
+  "credential_id": "local",
+  "client_nonce": "<32 random bytes encoded as unpadded base64url>",
+  "proof": "<HMAC-SHA-256 proof encoded as unpadded base64url>"
+}
+```
+
+The proof is `HMAC-SHA-256(key, message)`, where `key` is the local enrollment key, one-time pairing code, or registered client secret. Construct `message` by concatenating these bytes in order:
+
+```text
+ASCII("MineLights Protocol V2") || 0x00 || credential_type_ascii || 0x00 ||
+credential_id_ascii || 0x00 || server_id_ascii || 0x00 || client_id_ascii ||
+server_nonce[32] || client_nonce[32] || major_u16_be || minor_u16_be
+```
+
+There is no separator after `client_id_ascii`. Decode the server nonce from the hello before building the proof. For a registered client, use `client_secret` and its client UUID as the credential type and ID; remote enrollment uses `pairing_code` and the pairing ID from the file. The server replies with `AUTH_RESULT` (`0x0004`). Provider interest is applied only after normal client authentication succeeds; a control-only or enrollment connection should request an empty integration list.
+
+After a successful enrollment `AUTH_RESULT`, send a `REQUEST` (`0x0040`) to register the client:
+
+```json
+{
+  "request_id": "25b12412-437c-45f5-b41f-634e0149b56f",
+  "operation": "client.register",
+  "params": {
+    "client_id": "2ee8316a-cda0-4f2a-9f3d-25768269160e",
+    "client_secret": "<32 random bytes encoded as unpadded base64url>",
+    "app_id": "example-client",
+    "app_version": "1.0.0",
+    "display_name": "Example client",
+    "requested_scopes": ["devices.read", "lighting.write"]
+  }
+}
+```
+
+The registration sends the newly generated client secret inside the encrypted TLS connection. Check the `RESPONSE` (`0x0041`), close the enrollment connection, and reconnect using `client_secret` authentication. The [full protocol specification](https://github.com/megabytesme/MineLights/blob/5a558d8743fc0fa1fe488dde4fa2fda091c2fa5c/docs/PROTOCOL_V2.md#tls-identity-and-pairing) describes the complete handshake and error handling.
+
+#### 3. Discover devices and acquire a lease
+
+After normal authentication, the server sends a `DEVICE_LIST` (`0x0010`) snapshot. It can later send `DEVICE_CHANGED` (`0x0011`) as devices or providers change. A client can also send a `REQUEST` (`0x0040`) for a fresh snapshot:
+
+```json
+{
+  "request_id": "42f0497d-9e17-4af5-98d8-8e0435b61e1c",
+  "operation": "devices.get",
+  "params": {}
+}
+```
+
+The corresponding `RESPONSE` (`0x0041`) contains the same `request_id`, an `ok` flag, and a `result` containing `revision` and `devices`. A shortened example:
+
+```json
+{
+  "request_id": "42f0497d-9e17-4af5-98d8-8e0435b61e1c",
+  "ok": true,
+  "result": {
+    "revision": 1,
+    "devices": [
+      {
+        "device_id": "<stable device ID>",
+        "name": "Keyboard",
+        "vendor": "Corsair",
+        "integration": "Corsair",
+        "provider": "Corsair",
+        "legacy_device_key": "Corsair|Keyboard",
+        "elements": [{ "element_id": 0, "key": "LCTRL" }],
+        "capabilities": ["rgb", "keyboard-key-map"]
+      }
+    ]
+  }
+}
+```
+
+Each device has a stable `device_id`, name, vendor, integration, elements, and capabilities; elements include an `element_id` and may include a key name. Optional `provider` and `legacy_device_key` fields identify the RGB.NET provider and the old `manufacturer|model` key.
+
+Before sending colors, request a lease for the desired device IDs:
+
+```json
+{
+  "request_id": "061a9a62-cf15-40ad-9ab7-709d6951bafb",
+  "operation": "lighting.acquire",
+  "params": { "device_ids": ["<device_id from DEVICE_LIST>"] }
+}
+```
+
+A successful response includes `granted_device_ids` and `busy_device_ids`; a partial grant is possible. If none can be acquired, the server returns `LEASE_BUSY`. The server tray lets its owner assign paired clients High, Normal, or Low priority. A higher-priority client may preempt a lower-priority lease; a client receiving `LEASE_REQUIRED` should reacquire before sending more frames.
+
+#### 4. Send lighting frames
+
+Send a `LIGHTING_FRAME` (`0x0020`) over the same authenticated connection. Use IDs from the device snapshot and a lease held by this session:
+
+```json
+{
+  "sequence": 1,
+  "ttl_ms": 500,
+  "targets": [
+    {
+      "device_id": "<device_id from DEVICE_LIST>",
+      "colors": [
+        { "element_id": 0, "r": 255, "g": 0, "b": 0 },
+        { "element_id": 1, "r": 0, "g": 255, "b": 0 }
+      ]
+    }
+  ]
+}
+```
+
+Increment `sequence` for each frame and set `ttl_ms` from 1 to 1000. Valid frames renew the session's five-second lease; `PING` alone does not. The server restores idle lighting when a frame expires or its lease ends. Send a `lighting.release` request with `device_ids` when finished; disconnecting also releases the session's leases.
+
+Use `integrations.set` with a `providers` array to update this session's requested providers. The server combines requests from clients while respecting the owner's server-wide settings; one client cannot disable a provider needed by another. An authenticated client can also call `server.info` or request `server.shutdown`. Shutdown is refused while another authenticated session is connected or legacy access is enabled. Restart and configuration remain tray controls.
+
+For all message types, authentication details, scope requirements, error responses, and compatibility behavior, see the [complete V2 protocol specification](https://github.com/megabytesme/MineLights/blob/5a558d8743fc0fa1fe488dde4fa2fda091c2fa5c/docs/PROTOCOL_V2.md).
+
+<details>
+<summary>Deprecated: legacy V1 endpoints</summary>
 
 ### Legacy V1 endpoints (only when explicitly enabled)
 
@@ -79,7 +246,7 @@ Older clients use fixed loopback endpoints without authentication. This compatib
 
 #### 1. Handshake Endpoint
 
-This endpoint lets a legacy client request the current device layout. The server ignores client hardware-configuration fields; integrations remain server-owner settings.
+This endpoint lets a legacy client request a device layout filtered by its own settings. The server owner's integration and device restrictions still apply.
 
 *   **Protocol:** `TCP`
 *   **Port:** `63211`
@@ -96,11 +263,11 @@ The client initiates the connection and sends a JSON object prefixed with a 32-b
   "disabled_devices": ["Corsair|MM800 RGB POLARIS"]
 }
 ```
-*   **`enabled_integrations`** and **`disabled_devices`**: Legacy client settings, ignored by the server. Configure server integrations in the server's own `config.json`.
+*   **`enabled_integrations`** and **`disabled_devices`**: Filter the layout returned to this client. They do not change the server owner's configuration or other clients' settings.
 
 ##### Server -> Client Response
 
-The server sends back the current device layout as a JSON object prefixed with its length. The client configuration in its request is ignored.
+The server sends the filtered device layout as a JSON object prefixed with its length.
 
 **Structure:**
 ```json
@@ -109,7 +276,7 @@ The server sends back the current device layout as a JSON object prefixed with i
     {
       "sdk": "Corsair",
       "name": "K100 RGB",
-      "leds": [0, 1, 2, 3, ...],
+      "leds": [0, 1, 2, 3],
       "key_map": {
         "LCTRL": 0,
         "MINUS": 1,
@@ -120,7 +287,7 @@ The server sends back the current device layout as a JSON object prefixed with i
     {
       "sdk": "Corsair",
       "name": "DRAM",
-      "leds": [174, 175, 176, ...],
+      "leds": [174, 175, 176],
       "key_map": {
         "DRAM1": 174,
         "DRAM2": 175,
@@ -196,7 +363,9 @@ A raw UTF-8 string is broadcasted to all devices on the local network every 5 se
 **Message:**
 ```MINELIGHTS_PROXY_HELLO```
 
-The Minecraft client listens on this port for this specific message. Upon receiving it, the client knows the server is running and can initiate the **Handshake** process.
+Older Minecraft clients listen on this port for this message and can then initiate the **Handshake** process. Current MineLights clients use V2 instead.
+
+</details>
 
 ---
 
@@ -245,8 +414,9 @@ If you encounter issues, follow these steps:
     *   Verify that your device is not listed in the `DisabledDevices` section of `config.json`.
 
 4.  **No Connection Between Client and Server:**
-    *   Make sure Minecraft and `MineLights.exe` are running on the same computer.
-    *   If the server is running but MineLights does not connect, allow the Minecraft Java process to receive the UDP `63214` discovery message on private networks.
+    *   For a local V2 connection, run the client and server under the same Windows account and check `%LOCALAPPDATA%\MineLights\v2\endpoint.json` and the server log.
+    *   For a remote V2 connection, enable the intended interface in the tray, transfer a fresh pairing file securely, and check the network path and firewall.
+    *   Older V1 clients require explicit legacy access. If devices do not appear after approval, refresh the client or restart it.
 
 
 ## Roadmap
