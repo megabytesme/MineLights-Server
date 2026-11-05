@@ -153,12 +153,13 @@ public class MyAppContext : ApplicationContext
         {
             CheckOnClick = false,
             Checked = lightingServer.AllowLegacyLocalClients,
-            ToolTipText = "Allows unauthenticated V1 lighting from loopback only. V1 process-management commands remain disabled."
+            ToolTipText = "Allows unauthenticated V1 lighting from loopback only. Stop requests from V2 clients are refused while legacy access is enabled."
         };
         legacyClientsItem.Click += OnToggleLegacyClients;
         remoteAccessItem = new ToolStripMenuItem("Remote access…", null, OnConfigureRemoteAccess);
         serverSettings.DropDownItems.Add(legacyClientsItem);
         serverSettings.DropDownItems.Add(remoteAccessItem);
+        serverSettings.DropDownItems.Add(new ToolStripMenuItem("Review device filters…", null, (_, _) => ReviewDeviceFilters(false)));
         serverSettings.DropDownItems.Add(new ToolStripMenuItem("Export one-time pairing file…", null, OnExportPairingFile));
         revokeClientsItem = new ToolStripMenuItem("Revoke paired client");
         revokeClientsItem.DropDownOpening += OnRevokeClientsMenuOpening;
@@ -219,13 +220,36 @@ public class MyAppContext : ApplicationContext
         lightingServer.LegacyClientDetected += OnLegacyClientDetected;
         lightingServer.Start();
         RefreshConnectionMenu();
+        if (lightingServer.RequiresLegacyFilterReview)
+            trayIcon.ContextMenuStrip.BeginInvoke((Action)(() => ReviewDeviceFilters(true)));
+    }
+
+    private void ReviewDeviceFilters(bool legacyMigration)
+    {
+        var filters = lightingServer.GetGlobalDeviceFilters();
+        static string Summarize(string[] values) => values.Length == 0 ? "(none)" :
+            string.Join(", ", values.Take(12)) + (values.Length > 12 ? $" and {values.Length - 12} more" : "");
+        var introduction = legacyMigration
+            ? "An older MineLights Server saved device settings from a legacy client. These settings currently restrict every client, including V2 clients."
+            : "These server-wide filters restrict every client, in addition to each client's own settings.";
+        var message = $"{introduction}\n\nEnabled server providers: {Summarize(filters.Providers)}\nServer-disabled devices: {Summarize(filters.DisabledDevices)}\n\nYes: Enable all supported providers and clear the server-wide disabled-device list. This may interrupt lighting while devices refresh.\nNo: Keep the current server-wide filters.\nCancel: Decide later.\n\nIndividual clients retain their own device and integration settings.";
+        var answer = MessageBox.Show(message, "Review server device filters", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+        if (answer != DialogResult.Yes && answer != DialogResult.No) return;
+        try
+        {
+            lightingServer.ReviewGlobalDeviceFilters(answer == DialogResult.Yes);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show($"Could not update server device filters.\n\n{error.Message}", "MineLights", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void OnToggleLegacyClients(object? sender, EventArgs e)
     {
         var enable = !lightingServer.AllowLegacyLocalClients;
         if (enable && MessageBox.Show(
-                "Legacy V1 clients have no authentication and can send lighting to devices from local software. This permission is restricted to loopback. V1 shutdown and restart commands remain disabled. After allowing access, refresh devices in MineLights or restart the client if devices do not appear. Allow legacy local lighting clients?",
+                "Legacy V1 clients have no authentication and can send lighting to devices from local software. This permission is restricted to loopback. V1 shutdown and restart commands remain disabled. While legacy access is enabled, V2 clients cannot stop the server; disable legacy access or exit using the tray menu. After allowing access, refresh devices in MineLights or restart the client if devices do not appear. Allow legacy local lighting clients?",
                 "Allow legacy MineLights clients",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning) != DialogResult.Yes)
@@ -245,7 +269,7 @@ public class MyAppContext : ApplicationContext
                 if (lightingServer.AllowLegacyLocalClients)
                     return;
                 var answer = MessageBox.Show(
-                    "An unauthenticated legacy MineLights client tried to connect from this computer. Allow loopback lighting for legacy clients? The server will not accept legacy shutdown or restart commands. After allowing access, refresh devices in MineLights or restart the client if devices do not appear.",
+                    "An unauthenticated legacy MineLights client tried to connect from this computer. Allow loopback lighting for legacy clients? The server will not accept legacy shutdown or restart commands. While legacy access is enabled, V2 clients cannot stop the server; disable legacy access or exit using the tray menu. After allowing access, refresh devices in MineLights or restart the client if devices do not appear.",
                     "Legacy client blocked",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning);

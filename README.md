@@ -53,7 +53,7 @@ For the MineLights Server to function correctly, please ensure the following req
 
 *   **Local V2 connection:** MineLights Server listens on an OS-selected TCP port bound to loopback and writes a protected endpoint document under `%LOCALAPPDATA%\MineLights\v2\`. Updated clients use that endpoint for TLS and automatic local enrollment after the user authorizes the server to run.
 *   **Remote V2 connection:** Remote access is off by default. Enable it from the server tray menu, choose the network interfaces and port, then export a one-time `.mlpair` file for the client. Pairing files expire after five minutes and must be transferred securely. MineLights Server does not configure router port forwarding.
-*   **Legacy V1 clients:** Unauthenticated legacy lighting is off by default. The tray menu can enable it for loopback clients only. It does not expose V1 process-management commands.
+*   **Legacy V1 clients:** Unauthenticated legacy lighting is off by default. The tray menu can enable it for loopback clients only. It does not expose V1 process-management commands. Because V1 has no reliable disconnect signal, V2 shutdown requests are refused while legacy access is enabled; disable legacy access or exit from the tray when ready to stop the server.
 
 ---
 
@@ -67,13 +67,13 @@ For the MineLights Server to function correctly, please ensure the following req
 
 ### V2 Connections
 
-V2 uses one TLS TCP session for authentication, device discovery, requests, and lighting frames. Local clients discover the endpoint through the protected `endpoint.json` file, then enroll with the local key after the user permits MineLights Server to run. V2 does not use fixed network ports.
+V2 uses one TLS TCP session for authentication, device discovery, requests, and lighting frames. Local clients discover the endpoint through the protected `endpoint.json` file, then enroll with the local key after the user permits MineLights Server to run. The local port is chosen by the OS; the remote listener uses the port selected in the tray settings.
 
-The server tray menu provides owner controls for legacy V1 access, remote interface and port selection, pairing-file export, and revoking paired clients. Remote access is authenticated and requires an explicit one-time pairing file. No V2 operation can stop, restart, or reconfigure the server.
+The server tray menu provides owner controls for legacy V1 access, remote interface and port selection, pairing-file export, and revoking paired clients. Remote access is authenticated and requires an explicit one-time pairing file. An authenticated V2 client may request shutdown, which is refused if another authenticated session is connected or legacy access is enabled. Restart and configuration remain tray controls.
 
 ### Legacy V1 endpoints (only when explicitly enabled)
 
-Older clients use fixed loopback endpoints without authentication. This compatibility mode is disabled by default and can be enabled from the tray menu. It never enables the old raw command endpoint.
+Older clients use fixed loopback endpoints without authentication. This compatibility mode is disabled by default and can be enabled from the tray menu. It never enables the old raw command endpoint. Each legacy handshake filters its device list by that client's enabled integrations and disabled device IDs without changing the server owner's settings or other clients' devices. The server owner must also enable a provider in `config.json` for its devices to be available.
 
 ---
 
@@ -177,7 +177,7 @@ A JSON object containing an array of color updates.
 
 #### 3. Command Endpoint
 
-TCP `63213` remains bound to loopback as a presence probe so older clients can detect the server and continue to their legacy handshake. The listener closes every connection immediately without reading payloads; V1 commands are never executed. Shutdown and restart are available only from the server owner's tray controls.
+TCP `63213` remains bound to loopback as a presence probe so older clients can detect the server and continue to their legacy handshake. The listener closes every connection immediately without reading payloads; V1 commands are never executed. The tray menu and authenticated V2 shutdown requests manage server lifetime.
 
 ---
 
@@ -202,7 +202,7 @@ The Minecraft client listens on this port for this specific message. Upon receiv
 
 ## Configuration
 
-The server's behavior can be configured by editing the `config.json` file located in the same directory as `MineLights.exe`. If the file does not exist, it will be created with default values on the first run.
+The server's behavior can be configured by editing the `config.json` file located in the same directory as `MineLights.exe`. If the file does not exist, the server uses default values until a setting is saved.
 
 **Example `config.json`:**
 ```json
@@ -214,7 +214,9 @@ The server's behavior can be configured by editing the `config.json` file locate
     "Razer",
     "Wooting",
     "SteelSeries",
-    "Msi"
+    "Msi",
+    "Novation",
+    "PicoPi"
   ],
   "DisabledDevices": [
     "Corsair|MM800 RGB POLARIS"
@@ -222,9 +224,13 @@ The server's behavior can be configured by editing the `config.json` file locate
 }
 ```
 
-*   **`EnabledIntegrations`**: A list of hardware brands the server will try to initialize. You can remove entries from this list to prevent the server from hooking into certain SDKs, which can sometimes improve stability or resolve conflicts.
+*   **`EnabledIntegrations`**: A list of hardware brands the server will try to initialize. New configurations include all nine supported providers. Existing lists are preserved; add `Novation` or `PicoPi` to an older list if needed. An empty list disables all providers. You can remove entries to prevent the server from hooking into certain SDKs, which can sometimes improve stability or resolve conflicts.
 
 *   **`DisabledDevices`**: A list of specific devices to ignore. This is useful if a particular piece of hardware is causing issues but you still want to use other devices from the same brand. The format must be `"Manufacturer|Model"`, which you can find in the server's log files upon startup.
+
+Older server versions saved these global filters from whichever legacy client last connected. On upgrade, MineLights Server asks the owner to review them: choose to keep the existing filters or explicitly enable all providers and clear the server-wide disabled-device list. The **Server Connections → Review device filters** tray option is always available. Resetting these server-wide filters may interrupt lighting while devices are refreshed, and does not change individual clients' settings.
+
+Device snapshots made by earlier versions may not identify their provider. The server recognizes common manufacturer names and reports unknown providers in its log. If an integration-filtered client cannot see such an emulated device, create a fresh snapshot with the current server or add its correct `Provider` value to that device in the snapshot. Supported values are `Corsair`, `Logitech`, `Asus`, `Razer`, `Wooting`, `SteelSeries`, `Msi`, `Novation`, and `PicoPi`.
 
 ---
 ## Troubleshooting

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.AccessControl;
 using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -16,13 +17,18 @@ using RGB.NET.Devices.Wooting;
 
 public class LightingServer
 {
+    private const int CurrentConfigSchemaVersion = 2;
+    private static readonly string[] DefaultProviders =
+        { "Corsair", "Logitech", "Asus", "Razer", "Wooting", "SteelSeries", "Msi", "Novation", "PicoPi" };
     private volatile bool _isRunning = false;
     private CancellationTokenSource _cts = new();
     private V2ProtocolServer? _v2Protocol;
     private readonly Dictionary<string, Dictionary<uint, Led>> _v2LedMap = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Dictionary<uint, EmulatedLed>> _v2EmulatedLedMap = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Dictionary<uint, RGB.NET.Core.Color>> _v2DefaultColors = new(StringComparer.Ordinal);
     private readonly Dictionary<int, string> _v2DeviceByGlobalLed = new();
     private readonly object _v2MapLock = new();
+    private readonly Dictionary<IRGBDevice, string> _providerByDevice = new(ReferenceEqualityComparer.Instance);
     private readonly StableDeviceIdRegistry _deviceIdRegistry = new();
 
     private Thread? _handshakeThread,
@@ -37,16 +43,42 @@ public class LightingServer
 
     private readonly RGBSurface _surface;
     private readonly Dictionary<int, Led> _ledIdMap = new();
+    private readonly Dictionary<Led, int> _legacyIdsByLed = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<Led, RGB.NET.Core.Color> _originalColorsByLed = new(ReferenceEqualityComparer.Instance);
+    private HashSet<IRGBDevice> _knownSurfaceDevices = new(ReferenceEqualityComparer.Instance);
+    private long _nextLegacyLedId;
     private readonly object _deviceLock = new object();
 
-    private ServerConfig _config;
+    private volatile ServerConfig _config;
     private readonly string _configPath;
+    private readonly object _configLock = new();
 
-    private readonly List<IRGBDeviceProvider> _allProviders;
+    private readonly Dictionary<string, Func<IRGBDeviceProvider>> _providerFactories = new(StringComparer.Ordinal)
+    {
+        ["Msi"] = () => MsiDeviceProvider.Instance,
+        ["Corsair"] = () => CorsairDeviceProvider.Instance,
+        ["Logitech"] = () => LogitechDeviceProvider.Instance,
+        ["Asus"] = () => AsusDeviceProvider.Instance,
+        ["Razer"] = () => RazerDeviceProvider.Instance,
+        ["Wooting"] = () => WootingDeviceProvider.Instance,
+        ["SteelSeries"] = () => SteelSeriesDeviceProvider.Instance,
+        ["Novation"] = () => NovationDeviceProvider.Instance,
+        ["PicoPi"] = () => PicoPiDeviceProvider.Instance,
+    };
+    private readonly Dictionary<string, IRGBDeviceProvider> _providers = new(StringComparer.Ordinal);
+    private readonly object _interestLock = new();
+    private readonly Dictionary<string, HashSet<string>?> _v2ProviderInterests = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>?> _recentV2ProviderInterests = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _legacyProviderInterests = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _pendingLegacyProviderInterests = new(StringComparer.Ordinal);
+    private long _providerInterestRevision;
+    private int _providerUpdateQueued;
 
     private bool _isEmulationMode = false;
     private List<EmulatedDevice>? _emulatedDevices;
     private Dictionary<int, EmulatedLed>? _emulatedLedMap;
+    private Dictionary<EmulatedLed, int>? _emulatedIdsByLed;
+    private Dictionary<int, RGB.NET.Core.Color>? _emulatedDefaultColors;
     private long _lastLegacyPromptAtUtcTicks;
     private int _deviceRefreshQueued;
     private long _deviceLayoutRevision;
@@ -59,19 +91,6 @@ public class LightingServer
         _surface = new RGBSurface();
         _surface.SurfaceLayoutChanged += OnSurfaceLayoutChanged;
         _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
-
-        _allProviders = new List<IRGBDeviceProvider>
-    {
-        MsiDeviceProvider.Instance,
-        CorsairDeviceProvider.Instance,
-        LogitechDeviceProvider.Instance,
-        AsusDeviceProvider.Instance,
-        RazerDeviceProvider.Instance,
-        WootingDeviceProvider.Instance,
-        SteelSeriesDeviceProvider.Instance,
-        NovationDeviceProvider.Instance,
-        PicoPiDeviceProvider.Instance,
-    };
 
         _config = LoadConfig();
     }
@@ -89,7 +108,8 @@ public class LightingServer
                     Manufacturer = device.DeviceInfo.Manufacturer,
                     Model = device.DeviceInfo.Model,
                     DeviceType = device.DeviceInfo.DeviceType.ToString(),
-                    DeviceName = device.DeviceInfo.DeviceName
+                    DeviceName = device.DeviceInfo.DeviceName,
+                    Provider = GetProviderName(device)
                 };
 
                 foreach (var led in device)
@@ -139,6 +159,7 @@ public class LightingServer
         public string Model { get; set; }
         public string DeviceType { get; set; }
         public string DeviceName { get; set; }
+        public string? Provider { get; set; }
 
         public List<RawLedSnapshot> Leds { get; set; } = new();
     }
@@ -170,7 +191,11 @@ public class LightingServer
     public void LoadSnapshotForEmulation(RawSnapshotFile snapshot)
     {
         lock (_deviceLock)
+        lock (_v2MapLock)
         {
+            long ledCount = snapshot.Devices.Sum(device => (long)device.Leds.Count);
+            if (_nextLegacyLedId + ledCount > (long)int.MaxValue + 1)
+                throw new InvalidOperationException("Legacy LED ID space exhausted; restart MineLights Server.");
             _isEmulationMode = true;
 
             _emulatedDevices = snapshot.Devices
@@ -180,6 +205,7 @@ public class LightingServer
                     Model = d.Model,
                     DeviceType = d.DeviceType,
                     DeviceName = d.DeviceName,
+                    Provider = d.Provider,
                     Leds = d.Leds.Select(l => new EmulatedLed
                     {
                         LedId = l.LedId,
@@ -201,14 +227,34 @@ public class LightingServer
                 })
                 .ToList();
 
+            var unknownProviders = _emulatedDevices
+                .Where(device => string.IsNullOrWhiteSpace(device.Provider)
+                    && InferProviderName(device.Manufacturer) == null)
+                .Select(device => $"{device.Manufacturer}|{device.Model}")
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (unknownProviders.Length > 0)
+                Console.WriteLine("[Emulation] The snapshot lacks a known provider for: " + string.Join(", ", unknownProviders)
+                    + ". Integration-filtered clients cannot use these devices. Create a new snapshot with the current server,"
+                    + " or add the correct Provider field (for example Corsair, Asus, Msi, or PicoPi) to each device.");
+
             _emulatedLedMap = new Dictionary<int, EmulatedLed>();
-            int id = 0;
+            _emulatedIdsByLed = new Dictionary<EmulatedLed, int>(ReferenceEqualityComparer.Instance);
+            _emulatedDefaultColors = new Dictionary<int, RGB.NET.Core.Color>();
             foreach (var dev in _emulatedDevices)
                 foreach (var led in dev.Leds)
-                    _emulatedLedMap[id++] = led;
+                {
+                    int id = AllocateLegacyLedId();
+                    _emulatedLedMap[id] = led;
+                    _emulatedIdsByLed[led] = id;
+                    _emulatedDefaultColors[id] = new RGB.NET.Core.Color(led.A, led.R, led.G, led.B);
+                }
+
+            RefreshV2DeviceMaps();
 
             Console.WriteLine("[Emulation] Snapshot loaded. Emulation mode active.");
         }
+        _v2Protocol?.PublishDeviceListChanged();
     }
 
     public class EmulatedDevice
@@ -217,6 +263,7 @@ public class LightingServer
         public string Model { get; set; }
         public string DeviceType { get; set; }
         public string DeviceName { get; set; }
+        public string? Provider { get; set; }
 
         public List<EmulatedLed> Leds { get; set; } = new();
     }
@@ -246,6 +293,7 @@ public class LightingServer
     public void ExitEmulation()
     {
         lock (_deviceLock)
+        lock (_v2MapLock)
         {
             if (!_isEmulationMode)
                 return;
@@ -253,11 +301,14 @@ public class LightingServer
             _isEmulationMode = false;
             _emulatedDevices = null;
             _emulatedLedMap = null;
+            _emulatedIdsByLed = null;
+            _emulatedDefaultColors = null;
 
             ReconfigureSurfaceFromConfig();
 
             Console.WriteLine("[Emulation] Emulation mode exited. Real hardware restored.");
         }
+        _v2Protocol?.PublishDeviceListChanged();
     }
 
     private ServerConfig LoadConfig()
@@ -271,19 +322,10 @@ public class LightingServer
                 var config =
                     JsonConvert.DeserializeObject<ServerConfig>(json) ?? new ServerConfig();
 
-                if (config.EnabledIntegrations == null || !config.EnabledIntegrations.Any())
+                if (config.EnabledIntegrations == null)
                 {
                     Console.WriteLine("[Config] No integrations specified, enabling defaults.");
-                    config.EnabledIntegrations = new List<string>
-                    {
-                        "Corsair",
-                        "Logitech",
-                        "Asus",
-                        "Razer",
-                        "Wooting",
-                        "SteelSeries",
-                        "Msi",
-                    };
+                    config.EnabledIntegrations = DefaultProviders.ToList();
                 }
                 if (config.DisabledDevices == null)
                     config.DisabledDevices = new List<string>();
@@ -300,31 +342,56 @@ public class LightingServer
         Console.WriteLine("[Config] No config file found, creating a default one.");
         return new ServerConfig
         {
-            EnabledIntegrations = new List<string>
-            {
-                "Corsair",
-                "Logitech",
-                "Asus",
-                "Razer",
-                "Wooting",
-                "SteelSeries",
-                "Msi",
-            },
+            ConfigSchemaVersion = CurrentConfigSchemaVersion,
+            EnabledIntegrations = DefaultProviders.ToList(),
             DisabledDevices = new List<string>(),
         };
     }
 
-    private void SaveConfig()
+    private ServerConfig CopyConfig()
     {
+        return new ServerConfig
+        {
+            ConfigSchemaVersion = _config.ConfigSchemaVersion,
+            EnabledIntegrations = new List<string>(_config.EnabledIntegrations),
+            DisabledDevices = new List<string>(_config.DisabledDevices),
+            AllowLegacyLocalClients = _config.AllowLegacyLocalClients,
+            RemoteAccessEnabled = _config.RemoteAccessEnabled,
+            RemoteListenAddresses = new List<string>(_config.RemoteListenAddresses ?? new List<string>()),
+            RemotePort = _config.RemotePort,
+        };
+    }
+
+    // Write a complete same-directory file before replacing the existing one.
+    // Copy the existing Windows access rules to the staging file and fail closed
+    // if the filesystem cannot perform the replacement.
+    private void SaveConfig(ServerConfig config)
+    {
+        string temp = _configPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            string json = JsonConvert.SerializeObject(_config, Formatting.Indented);
-            File.WriteAllText(_configPath, json);
+            byte[] bytes = new UTF8Encoding(false).GetBytes(JsonConvert.SerializeObject(config, Formatting.Indented));
+            using (new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+            if (OperatingSystem.IsWindows() && File.Exists(_configPath))
+            {
+                var access = new FileInfo(_configPath).GetAccessControl(AccessControlSections.Access);
+                new FileInfo(temp).SetAccessControl(access);
+            }
+            using (var stream = new FileStream(temp, FileMode.Open, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            if (File.Exists(_configPath))
+                File.Replace(temp, _configPath, destinationBackupFileName: null);
+            else
+                File.Move(temp, _configPath);
             Console.WriteLine($"[Config] Configuration saved to {_configPath}");
         }
-        catch (Exception ex)
+        finally
         {
-            Console.WriteLine($"[Config] Error saving config: {ex.Message}");
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch (IOException error) { Console.WriteLine($"[Config] Could not remove temporary config: {error.Message}"); }
         }
     }
 
@@ -335,7 +402,9 @@ public class LightingServer
 
         ReconfigureSurfaceFromConfig();
 
-        _v2Protocol = new V2ProtocolServer(GetV2DeviceList, ApplyV2Frame, RestoreV2Devices);
+        _v2Protocol = new V2ProtocolServer(GetV2DeviceList, ApplyV2Frame, RestoreV2Devices,
+            legacyCompatibilityEnabled: _config.AllowLegacyLocalClients,
+            updateProviderInterest: SetV2ProviderInterest, removeProviderInterest: RemoveV2ProviderInterest);
         _v2Protocol.Start();
         if (_config.RemoteAccessEnabled)
         {
@@ -365,6 +434,32 @@ public class LightingServer
     public event Action? LegacyClientDetected;
 
     public bool AllowLegacyLocalClients => _config.AllowLegacyLocalClients;
+    public bool RequiresLegacyFilterReview => _config.ConfigSchemaVersion < CurrentConfigSchemaVersion;
+    public (string[] Providers, string[] DisabledDevices) GetGlobalDeviceFilters()
+    {
+        lock (_configLock)
+            return (_config.EnabledIntegrations.ToArray(), _config.DisabledDevices.ToArray());
+    }
+
+    public void ReviewGlobalDeviceFilters(bool reset)
+    {
+        lock (_configLock)
+        {
+            var updated = CopyConfig();
+            if (reset)
+            {
+                updated.EnabledIntegrations = DefaultProviders.ToList();
+                updated.DisabledDevices.Clear();
+            }
+            updated.ConfigSchemaVersion = CurrentConfigSchemaVersion;
+            SaveConfig(updated);
+            _config = updated;
+        }
+        if (reset && _isRunning)
+        {
+            if (ReconfigureSurfaceFromConfig()) _v2Protocol?.PublishDeviceListChanged();
+        }
+    }
     public bool RemoteAccessEnabled => _v2Protocol?.RemoteEnabled == true;
     public IReadOnlyList<string> RemoteListenAddresses => _config.RemoteListenAddresses ?? new List<string>();
     public int RemotePort => _v2Protocol?.RemoteEnabled == true ? _v2Protocol.Port : _config.RemotePort;
@@ -372,11 +467,15 @@ public class LightingServer
     public void ConfigureRemoteAccess(IEnumerable<IPAddress> addresses, int port)
     {
         var selected = addresses.Distinct().ToArray();
+        lock (_configLock)
+        {
         if (selected.Length == 0)
         {
+            var updated = CopyConfig();
+            updated.RemoteAccessEnabled = false;
+            SaveConfig(updated);
+            _config = updated;
             _v2Protocol?.DisableRemoteAccess();
-            _config.RemoteAccessEnabled = false;
-            SaveConfig();
             return;
         }
         if (port is < 1 or > 65535)
@@ -384,13 +483,32 @@ public class LightingServer
         if (_v2Protocol == null)
             throw new InvalidOperationException("The lighting server is not running.");
 
-        _v2Protocol.ConfigureRemoteAccess(selected, port);
-        if (!_v2Protocol.RemoteEnabled)
-            throw new IOException("Remote access could not be enabled; the loopback V2 service remains available.");
-        _config.RemoteAccessEnabled = true;
-        _config.RemoteListenAddresses = _v2Protocol.RemoteAddresses.Select(address => address.ToString()).ToList();
-        _config.RemotePort = port;
-        SaveConfig();
+        var previousEnabled = _v2Protocol.RemoteEnabled;
+        var previousAddresses = _v2Protocol.RemoteAddresses.ToArray();
+        var previousPort = _config.RemotePort;
+        try
+        {
+            _v2Protocol.ConfigureRemoteAccess(selected, port);
+            if (!_v2Protocol.RemoteEnabled)
+                throw new IOException("Remote access could not be enabled; the loopback V2 service remains available.");
+            var updated = CopyConfig();
+            updated.RemoteAccessEnabled = true;
+            updated.RemoteListenAddresses = _v2Protocol.RemoteAddresses.Select(address => address.ToString()).ToList();
+            updated.RemotePort = port;
+            SaveConfig(updated);
+            _config = updated;
+        }
+        catch
+        {
+            try
+            {
+                if (previousEnabled) _v2Protocol.ConfigureRemoteAccess(previousAddresses, previousPort);
+                else _v2Protocol.DisableRemoteAccess();
+            }
+            catch (Exception error) { Console.WriteLine($"[V2] Could not restore previous listener: {error.Message}"); }
+            throw;
+        }
+        }
     }
 
     public IReadOnlyList<JObject> ListV2Clients() => _v2Protocol?.ListClients() ?? Array.Empty<JObject>();
@@ -405,14 +523,49 @@ public class LightingServer
 
     public void SetLegacyLocalCompatibility(bool allow)
     {
+        lock (_configLock)
+        {
         if (_config.AllowLegacyLocalClients == allow)
             return;
-        _config.AllowLegacyLocalClients = allow;
-        SaveConfig();
+        // Enabling V1 blocks V2 shutdown first; disabling V1 stops its
+        // listener before allowing V2 shutdown again.
+        if (allow) _v2Protocol?.SetLegacyCompatibilityEnabled(true);
+        try
+        {
+            var updated = CopyConfig();
+            updated.AllowLegacyLocalClients = allow;
+            SaveConfig(updated);
+            // Serialize the effective permission change with an in-flight V1
+            // frame. Once this returns, no older frame can apply afterwards.
+            lock (_deviceLock) _config = updated;
+        }
+        catch
+        {
+            if (allow) _v2Protocol?.SetLegacyCompatibilityEnabled(false);
+            throw;
+        }
         if (allow)
+        {
             StartLegacyLightingListener();
+            lock (_interestLock)
+            {
+                _legacyProviderInterests.UnionWith(_pendingLegacyProviderInterests);
+                _pendingLegacyProviderInterests.Clear();
+            }
+            QueueProviderReconciliation();
+        }
         else
+        {
             StopLegacyLightingListener();
+            lock (_interestLock)
+            {
+                _legacyProviderInterests.Clear();
+                _pendingLegacyProviderInterests.Clear();
+            }
+            QueueProviderReconciliation();
+            _v2Protocol?.SetLegacyCompatibilityEnabled(false);
+        }
+        }
     }
 
     private void StartLegacyHandshakeDetector()
@@ -491,15 +644,17 @@ public class LightingServer
             return;
         try
         {
-            _udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 63212));
-            _udpListenerThread = new Thread(() => UdpServerLoop(_cts.Token))
+            var udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 63212));
+            _udpClient = udpClient;
+            _udpListenerThread = new Thread(() => UdpServerLoop(udpClient, _cts.Token))
             {
                 IsBackground = true,
                 Name = "Legacy V1 UDP Listener",
             };
             _udpListenerThread.Start();
-            _discoveryClient = new UdpClient { EnableBroadcast = true };
-            _discoveryThread = new Thread(() => DiscoveryBroadcastLoop(_cts.Token))
+            var discoveryClient = new UdpClient { EnableBroadcast = true };
+            _discoveryClient = discoveryClient;
+            _discoveryThread = new Thread(() => DiscoveryBroadcastLoop(discoveryClient, _cts.Token))
             {
                 IsBackground = true,
                 Name = "Legacy V1 Discovery",
@@ -519,10 +674,12 @@ public class LightingServer
 
     private void StopLegacyLightingListener()
     {
-        try { _udpClient?.Close(); } catch { }
-        try { _discoveryClient?.Close(); } catch { }
+        var udpClient = _udpClient;
+        var discoveryClient = _discoveryClient;
         _udpClient = null;
         _discoveryClient = null;
+        try { udpClient?.Close(); } catch { }
+        try { discoveryClient?.Close(); } catch { }
         Join(_udpListenerThread, 1000);
         Join(_discoveryThread, 1000);
         _udpListenerThread = null;
@@ -575,7 +732,7 @@ public class LightingServer
                 catch { }
             }
 
-            foreach (var provider in _allProviders)
+            foreach (var provider in _providers.Values)
             {
                 try
                 {
@@ -584,6 +741,7 @@ public class LightingServer
                 }
                 catch { }
             }
+            _providers.Clear();
         }
 
         try
@@ -605,83 +763,194 @@ public class LightingServer
         catch { }
     }
 
-    private void ReconfigureSurfaceFromConfig()
+    private void SetV2ProviderInterest(string sessionId, IReadOnlyList<string>? providers)
     {
+        lock (_interestLock)
+            _v2ProviderInterests[sessionId] = providers == null ? null : new HashSet<string>(providers, StringComparer.Ordinal);
+        QueueProviderReconciliation();
+    }
+
+    private void RemoveV2ProviderInterest(string sessionId)
+    {
+        lock (_interestLock)
+        {
+            if (!_v2ProviderInterests.Remove(sessionId, out var providers)) return;
+            // V2 clients may reconnect when a device list changes. Retain the
+            // old interest briefly so that an SDK is not repeatedly unloaded.
+            _recentV2ProviderInterests[sessionId] = providers;
+        }
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(5), _cts.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            lock (_interestLock) _recentV2ProviderInterests.Remove(sessionId);
+            QueueProviderReconciliation();
+        });
+    }
+
+    private HashSet<string> RequestedProviders()
+    {
+        lock (_interestLock)
+        {
+            var requested = new HashSet<string>(_legacyProviderInterests, StringComparer.Ordinal);
+            foreach (var providers in _v2ProviderInterests.Values.Concat(_recentV2ProviderInterests.Values))
+            {
+                if (providers == null) requested.UnionWith(DefaultProviders); // Older V2 clients did not declare interest.
+                else requested.UnionWith(providers);
+            }
+            return requested;
+        }
+    }
+
+    private void QueueProviderReconciliation()
+    {
+        Interlocked.Increment(ref _providerInterestRevision);
+        if (!_isRunning || Interlocked.Exchange(ref _providerUpdateQueued, 1) != 0) return;
+        _ = Task.Run(async () =>
+        {
+            long handled = -1;
+            try
+            {
+                do
+                {
+                    handled = Interlocked.Read(ref _providerInterestRevision);
+                    // Coalesce reconnects and rapid setting changes before releasing SDKs.
+                    await Task.Delay(500, _cts.Token).ConfigureAwait(false);
+                    if (!_isRunning) return;
+                    if (ReconfigureSurfaceFromConfig()) _v2Protocol?.PublishDeviceListChanged();
+                } while (handled != Interlocked.Read(ref _providerInterestRevision));
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception error) { Console.WriteLine($"[Server] Provider update failed: {error.Message}"); }
+            finally
+            {
+                Interlocked.Exchange(ref _providerUpdateQueued, 0);
+                if (_isRunning && handled != Interlocked.Read(ref _providerInterestRevision)) QueueProviderReconciliation();
+            }
+        });
+    }
+
+    private bool SetLegacyProviderInterest(HashSet<string>? providers)
+    {
+        lock (_interestLock)
+        {
+            var target = _config.AllowLegacyLocalClients ? _legacyProviderInterests : _pendingLegacyProviderInterests;
+            target.UnionWith(providers == null ? DefaultProviders : providers.Where(name => _providerFactories.ContainsKey(name)));
+            if (!_config.AllowLegacyLocalClients) return false;
+        }
+        // Old V1 clients perform only one handshake, so complete discovery
+        // before returning its layout instead of relying on a later event.
+        if (ReconfigureSurfaceFromConfig()) _v2Protocol?.PublishDeviceListChanged();
+        return true;
+    }
+
+    private bool ReconfigureSurfaceFromConfig()
+    {
+        var requested = RequestedProviders();
         lock (_deviceLock)
         {
-            Console.WriteLine("[Server] Configuring surface based on settings...");
-
-            var currentDevices = _surface.Devices.ToList();
-            if (currentDevices.Any())
-                _surface.Detach(currentDevices);
-
-            foreach (var provider in _allProviders)
+            if (_isEmulationMode)
             {
-                string providerName = provider.GetType().Name.Replace("DeviceProvider", "");
-                bool shouldBeEnabled = _config.EnabledIntegrations.Contains(providerName);
-
-                if (shouldBeEnabled && !provider.IsInitialized)
+                RefreshV2DeviceMaps();
+                return false;
+            }
+            var ownerAllowed = new HashSet<string>(_config.EnabledIntegrations, StringComparer.Ordinal);
+            requested.IntersectWith(ownerAllowed);
+            foreach (var providerName in _providers.Keys.Where(name => !requested.Contains(name)).ToArray())
+            {
+                var provider = _providers[providerName];
+                var attached = provider.Devices.Where(device => _surface.Devices.Contains(device)).ToArray();
+                if (attached.Length > 0) _surface.Detach(attached);
+                try { provider.Dispose(); }
+                catch (Exception error) { Console.WriteLine($"[Server] Could not release {providerName}: {error.Message}"); }
+                _providers.Remove(providerName);
+            }
+            foreach (var providerName in requested.Where(name => !_providers.ContainsKey(name)))
+            {
+                // Interest may have changed while another provider was being
+                // initialized. Do not start an SDK for a stale request.
+                if (!RequestedProviders().Contains(providerName) || !_config.EnabledIntegrations.Contains(providerName)) continue;
+                if (!_providerFactories.TryGetValue(providerName, out var factory)) continue;
+                if (providerName == "Msi" && !Program.IsRunningAsAdmin())
                 {
-                    if (provider is MsiDeviceProvider && !Program.IsRunningAsAdmin())
-                    {
-                        Console.WriteLine(
-                            $"[Server] -> Skipping {providerName}: Not running as admin."
-                        );
-                        continue;
-                    }
-                    try
-                    {
-                        Console.WriteLine($"[Server] Initializing {providerName}...");
-                        provider.Initialize(throwExceptions: true);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine(
-                            $"[Server] -> WARNING: Initializing {providerName} failed. Details: {ex}"
-                        );
-                    }
+                    Console.WriteLine("[Server] -> Skipping Msi: Not running as admin.");
+                    continue;
                 }
-                else if (!shouldBeEnabled && provider.IsInitialized)
+                IRGBDeviceProvider? provider = null;
+                try
                 {
-                    Console.WriteLine($"[Server] Disposing disabled provider: {providerName}");
-                    try
-                    {
-                        provider.Dispose();
-                    }
-                    catch { }
+                    provider = factory();
+                    Console.WriteLine($"[Server] Initializing requested {providerName}...");
+                    if (!provider.Initialize(throwExceptions: true))
+                        throw new InvalidOperationException("Provider initialization failed.");
+                    _providers[providerName] = provider;
+                }
+                catch (Exception error)
+                {
+                    Console.WriteLine($"[Server] -> WARNING: Initializing {providerName} failed: {error.Message}");
+                    try { provider?.Dispose(); } catch { }
                 }
             }
 
-            var devicesToAttach = _allProviders
-                .Where(p => p.IsInitialized)
-                .SelectMany(p => p.Devices)
+            var desired = new HashSet<IRGBDevice>(_providers.Values.SelectMany(provider => provider.Devices)
                 .Where(d =>
                     !_config.DisabledDevices.Contains(
                         $"{d.DeviceInfo.Manufacturer}|{d.DeviceInfo.Model}"
                     )
-                )
-                .ToList();
-
-            if (devicesToAttach.Any())
-                _surface.Attach(devicesToAttach);
+                ), ReferenceEqualityComparer.Instance);
+            var current = new HashSet<IRGBDevice>(_surface.Devices, ReferenceEqualityComparer.Instance);
+            var removed = current.Where(device => !desired.Contains(device)).ToArray();
+            var added = desired.Where(device => !current.Contains(device)).ToArray();
+            if (removed.Length > 0) _surface.Detach(removed);
+            if (added.Length > 0) _surface.Attach(added);
 
             Console.WriteLine($"[RGB.NET] Final device count: {_surface.Devices.Count()}");
-            BuildIdMaps();
+            return BuildIdMaps();
         }
     }
 
-    private void BuildIdMaps()
+    private int AllocateLegacyLedId()
     {
-        _ledIdMap.Clear();
-        int currentLedId = 0;
+        if (_nextLegacyLedId > int.MaxValue)
+            throw new InvalidOperationException("Legacy LED ID space exhausted; restart MineLights Server.");
+        return (int)_nextLegacyLedId++;
+    }
 
+    private bool BuildIdMaps()
+    {
+        var devices = new HashSet<IRGBDevice>(_surface.Devices, ReferenceEqualityComparer.Instance);
+        var leds = new HashSet<Led>(devices.SelectMany(device => device), ReferenceEqualityComparer.Instance);
+        long newLedCount = leds.LongCount(led => !_legacyIdsByLed.ContainsKey(led));
+        if (_nextLegacyLedId + newLedCount > (long)int.MaxValue + 1)
+            throw new InvalidOperationException("Legacy LED ID space exhausted; restart MineLights Server.");
+        bool changed = !_knownSurfaceDevices.SetEquals(devices) || !new HashSet<Led>(_legacyIdsByLed.Keys, ReferenceEqualityComparer.Instance).SetEquals(leds);
+        _knownSurfaceDevices = devices;
+        foreach (var old in _legacyIdsByLed.Keys.Where(led => !leds.Contains(led)).ToArray())
+        {
+            _legacyIdsByLed.Remove(old);
+            _originalColorsByLed.Remove(old);
+        }
+        _ledIdMap.Clear();
         foreach (var device in _surface.Devices)
         {
             foreach (var led in device)
-                _ledIdMap.Add(currentLedId++, led);
+            {
+                if (!_legacyIdsByLed.TryGetValue(led, out var id))
+                {
+                    id = AllocateLegacyLedId();
+                    _legacyIdsByLed.Add(led, id);
+                    // RGB.NET blends assignments by alpha. Capture an opaque
+                    // RGB baseline so restoring a transparent initial color
+                    // actually replaces a previously applied effect.
+                    var color = led.Color;
+                    _originalColorsByLed[led] = new RGB.NET.Core.Color(color.R, color.G, color.B);
+                }
+                _ledIdMap.Add(id, led);
+            }
         }
         Console.WriteLine($"[Server] Mapped {_ledIdMap.Count} total LEDs across all devices.");
         RefreshV2DeviceMaps();
+        return changed;
     }
 
     private void OnSurfaceLayoutChanged(SurfaceLayoutChangedEventArgs args)
@@ -705,9 +974,10 @@ public class LightingServer
                 {
                     processedRevision = Interlocked.Read(ref _deviceLayoutRevision);
                     await Task.Delay(200, _cts.Token).ConfigureAwait(false);
+                    bool changed;
                     lock (_deviceLock)
-                        BuildIdMaps();
-                    _v2Protocol?.PublishDeviceListChanged();
+                        changed = BuildIdMaps();
+                    if (changed) _v2Protocol?.PublishDeviceListChanged();
                 }
                 while (processedRevision != Interlocked.Read(ref _deviceLayoutRevision));
             }
@@ -756,6 +1026,8 @@ public class LightingServer
                         ["name"] = device.DeviceName,
                         ["vendor"] = device.Manufacturer,
                         ["integration"] = device.Manufacturer,
+                        ["provider"] = device.Provider ?? InferProviderName(device.Manufacturer),
+                        ["legacy_device_key"] = $"{device.Manufacturer}|{device.Model}",
                         ["elements"] = elements,
                         ["capabilities"] = EmulatedCapabilities(device.DeviceType)
                     });
@@ -781,6 +1053,8 @@ public class LightingServer
                     ["name"] = device.DeviceInfo.DeviceName,
                     ["vendor"] = device.DeviceInfo.Manufacturer,
                     ["integration"] = device.DeviceInfo.Manufacturer,
+                    ["provider"] = GetProviderName(device),
+                    ["legacy_device_key"] = $"{device.DeviceInfo.Manufacturer}|{device.DeviceInfo.Model}",
                     ["elements"] = elements,
                     ["capabilities"] = DeviceCapabilities(device.DeviceInfo.DeviceType)
                 });
@@ -794,23 +1068,31 @@ public class LightingServer
         lock (_v2MapLock)
         {
             _v2LedMap.Clear();
+            _v2EmulatedLedMap.Clear();
             _v2DefaultColors.Clear();
             _v2DeviceByGlobalLed.Clear();
+            _providerByDevice.Clear();
+            foreach (var entry in _providers)
+                foreach (var device in entry.Value.Devices)
+                    _providerByDevice[device] = entry.Key;
             if (_isEmulationMode && _emulatedDevices != null && _emulatedLedMap != null)
             {
                 var ids = ResolveEmulatedDeviceIds(_emulatedDevices);
                 foreach (var device in _emulatedDevices)
                 {
                     var deviceId = ids[device];
-                    var ledMap = new Dictionary<uint, Led>();
+                    var emulatedMap = new Dictionary<uint, EmulatedLed>();
                     var defaults = new Dictionary<uint, RGB.NET.Core.Color>();
                     for (uint index = 0; index < device.Leds.Count; index++)
                     {
                         var emulated = device.Leds[(int)index];
-                        var globalId = _emulatedLedMap.FirstOrDefault(pair => ReferenceEquals(pair.Value, emulated)).Key;
+                        var globalId = _emulatedIdsByLed![emulated];
+                        emulatedMap[index] = emulated;
+                        if (_emulatedDefaultColors != null && _emulatedDefaultColors.TryGetValue(globalId, out var original))
+                            defaults[index] = original;
                         _v2DeviceByGlobalLed[globalId] = deviceId;
                     }
-                    _v2LedMap[deviceId] = ledMap;
+                    _v2EmulatedLedMap[deviceId] = emulatedMap;
                     _v2DefaultColors[deviceId] = defaults;
                 }
                 return;
@@ -827,9 +1109,8 @@ public class LightingServer
                 foreach (var led in device)
                 {
                     ledMap[index] = led;
-                    defaults[index] = led.Color;
-                    var globalId = _ledIdMap.FirstOrDefault(pair => ReferenceEquals(pair.Value, led)).Key;
-                    _v2DeviceByGlobalLed[globalId] = deviceId;
+                    if (_originalColorsByLed.TryGetValue(led, out var original)) defaults[index] = original;
+                    if (_legacyIdsByLed.TryGetValue(led, out var globalId)) _v2DeviceByGlobalLed[globalId] = deviceId;
                     index++;
                 }
                 _v2LedMap[deviceId] = ledMap;
@@ -837,6 +1118,40 @@ public class LightingServer
             }
         }
     }
+
+    private string? GetProviderName(IRGBDevice device)
+    {
+        lock (_v2MapLock)
+            return _providerByDevice.TryGetValue(device, out var provider) ? provider : null;
+    }
+
+    // Older emulation snapshots predate the provider field. Infer only known
+    // manufacturers; real devices use their actual RGB.NET provider instead.
+    private static string? InferProviderName(string? manufacturer)
+    {
+        if (string.IsNullOrWhiteSpace(manufacturer)) return null;
+        var name = manufacturer.Trim();
+        if (name.Equals("RGB.NET", StringComparison.OrdinalIgnoreCase)) return "PicoPi";
+        if (name.Equals("ASUSTeK COMPUTER INC.", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("ASUSTeK COMPUTER INC", StringComparison.OrdinalIgnoreCase)) return "Asus";
+        if (name.Equals("Micro-Star International Co., Ltd.", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("Micro-Star International Co., Ltd", StringComparison.OrdinalIgnoreCase)) return "Msi";
+        return DefaultProviders.FirstOrDefault(provider => provider.Equals(name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static HashSet<string>? ReadLegacyFilter(JObject config, string property)
+    {
+        var token = config[property];
+        if (token == null || token.Type == JTokenType.Null) return null;
+        if (token is not JArray values || values.Any(value => value.Type != JTokenType.String))
+            throw new JsonException($"Invalid {property} in legacy client config.");
+        return new HashSet<string>(values.Select(value => value.Value<string>()!), StringComparer.Ordinal);
+    }
+
+    private static bool LegacyDeviceAllowed(HashSet<string>? enabled, HashSet<string>? disabled,
+        string? provider, string manufacturer, string model)
+        => (enabled == null || (provider != null && enabled.Contains(provider)))
+            && (disabled == null || !disabled.Contains($"{manufacturer}|{model}"));
 
     private void ApplyV2Frame(JObject frame)
     {
@@ -849,26 +1164,24 @@ public class LightingServer
             foreach (var target in targets.OfType<JObject>())
             {
                 var deviceId = target.Value<string>("device_id");
-                if (deviceId == null || !_v2LedMap.TryGetValue(deviceId, out var ledMap) || target["colors"] is not JArray colors)
+                if (deviceId == null || target["colors"] is not JArray colors)
                     continue;
+                _v2LedMap.TryGetValue(deviceId, out var ledMap);
+                _v2EmulatedLedMap.TryGetValue(deviceId, out var emulatedMap);
                 foreach (var color in colors.OfType<JObject>())
                 {
-                    if (!uint.TryParse(color["element_id"]?.ToString(), out var elementId) || !ledMap.TryGetValue(elementId, out var led))
+                    if (!uint.TryParse(color["element_id"]?.ToString(), out var elementId))
                         continue;
                     var red = color.Value<int>("r");
                     var green = color.Value<int>("g");
                     var blue = color.Value<int>("b");
-                    if (_isEmulationMode && _emulatedDevices != null && _emulatedLedMap != null)
+                    if (_isEmulationMode && emulatedMap != null && emulatedMap.TryGetValue(elementId, out var emulated))
                     {
-                        var globalId = _ledIdMap.FirstOrDefault(pair => ReferenceEquals(pair.Value, led)).Key;
-                        if (_emulatedLedMap.TryGetValue(globalId, out var emulated))
-                        {
-                            emulated.R = red / 255f;
-                            emulated.G = green / 255f;
-                            emulated.B = blue / 255f;
-                        }
+                        emulated.R = red / 255f;
+                        emulated.G = green / 255f;
+                        emulated.B = blue / 255f;
                     }
-                    else
+                    else if (!_isEmulationMode && ledMap != null && ledMap.TryGetValue(elementId, out var led))
                     {
                         led.Color = new RGB.NET.Core.Color((byte)red, (byte)green, (byte)blue);
                         changed = true;
@@ -887,13 +1200,22 @@ public class LightingServer
         {
             foreach (var deviceId in deviceIds)
             {
-                if (!_v2LedMap.TryGetValue(deviceId, out var leds) || !_v2DefaultColors.TryGetValue(deviceId, out var defaults))
+                if (!_v2DefaultColors.TryGetValue(deviceId, out var defaults))
                     continue;
-                foreach (var pair in leds)
+                if (_isEmulationMode && _v2EmulatedLedMap.TryGetValue(deviceId, out var emulatedLeds))
                 {
-                    if (defaults.TryGetValue(pair.Key, out var color))
-                        pair.Value.Color = color;
+                    foreach (var pair in emulatedLeds)
+                    {
+                        if (!defaults.TryGetValue(pair.Key, out var color)) continue;
+                        pair.Value.A = color.A;
+                        pair.Value.R = color.R;
+                        pair.Value.G = color.G;
+                        pair.Value.B = color.B;
+                    }
                 }
+                else if (!_isEmulationMode && _v2LedMap.TryGetValue(deviceId, out var leds))
+                    foreach (var pair in leds)
+                        if (defaults.TryGetValue(pair.Key, out var color)) pair.Value.Color = color;
             }
             if (!_isEmulationMode)
                 _surface.Update();
@@ -986,15 +1308,25 @@ public class LightingServer
                         throw new EndOfStreamException("Client disconnected before sending its full config.");
 
                     string clientConfigJson = Encoding.UTF8.GetString(clientConfigBytes);
-                    _ = JObject.Parse(clientConfigJson);
+                    var clientConfig = JObject.Parse(clientConfigJson);
+                    var enabled = ReadLegacyFilter(clientConfig, "enabled_integrations");
+                    var disabled = ReadLegacyFilter(clientConfig, "disabled_devices");
                     if (!_config.AllowLegacyLocalClients)
                     {
+                        SetLegacyProviderInterest(enabled); // Record only; never initialize before owner approval.
                         NotifyLegacyClientAttempt();
                         continue;
                     }
 
+                    // Filter only this legacy response. A V1 client must not
+                    // reconfigure the shared server or other clients' devices.
+                    if (!SetLegacyProviderInterest(enabled)) continue;
+
                     lock (_deviceLock)
                     {
+                        // Consent can be revoked while a requested provider is
+                        // initializing; do not return a stale approved layout.
+                        if (!_config.AllowLegacyLocalClients) continue;
                         JArray devicesArray;
 
                         if (_isEmulationMode && _emulatedDevices != null)
@@ -1003,6 +1335,8 @@ public class LightingServer
 
                             foreach (var dev in _emulatedDevices)
                             {
+                                if (!LegacyDeviceAllowed(enabled, disabled, dev.Provider ?? InferProviderName(dev.Manufacturer), dev.Manufacturer, dev.Model))
+                                    continue;
                                 var deviceKeyMap = new JObject();
                                 var deviceLeds = new List<int>();
 
@@ -1035,6 +1369,8 @@ public class LightingServer
                                     .ThenBy(d => d.DeviceInfo.Model)
                             )
                             {
+                                if (!LegacyDeviceAllowed(enabled, disabled, GetProviderName(device), device.DeviceInfo.Manufacturer, device.DeviceInfo.Model))
+                                    continue;
                                 var deviceKeyMap = new JObject();
                                 var deviceLeds = new List<int>();
 
@@ -1108,13 +1444,12 @@ public class LightingServer
         }
     }
 
-    private void UdpServerLoop(CancellationToken ct)
+    private void UdpServerLoop(UdpClient udpClient, CancellationToken ct)
     {
-        var udpClient = _udpClient!;
         var from = new IPEndPoint(IPAddress.Any, 0);
         try
         {
-            while (_isRunning && !ct.IsCancellationRequested)
+            while (_isRunning && ReferenceEquals(_udpClient, udpClient) && !ct.IsCancellationRequested)
             {
                 if (udpClient.Available == 0)
                 {
@@ -1125,39 +1460,55 @@ public class LightingServer
                 byte[] recvBuffer = udpClient.Receive(ref from);
                 string jsonString = Encoding.UTF8.GetString(recvBuffer);
 
-                JObject? frameData = null;
+                JArray? colors = null;
                 try
                 {
-                    frameData = JObject.Parse(jsonString);
+                    colors = JObject.Parse(jsonString)["led_colors"] as JArray;
                 }
-                catch { }
+                catch (JsonException) { }
 
-                if (frameData?["led_colors"] is JArray colors)
+                if (colors != null)
                 {
+                    var updates = new List<(int Id, byte R, byte G, byte B)>();
+                    bool valid = true;
+                    foreach (var token in colors)
+                    {
+                        if (token is not JObject item
+                            || !TryLegacyInteger(item["id"], int.MaxValue, out var id)
+                            || !TryLegacyInteger(item["r"], byte.MaxValue, out var red)
+                            || !TryLegacyInteger(item["g"], byte.MaxValue, out var green)
+                            || !TryLegacyInteger(item["b"], byte.MaxValue, out var blue))
+                        {
+                            valid = false;
+                            break;
+                        }
+                        updates.Add((id, (byte)red, (byte)green, (byte)blue));
+                    }
+                    if (!valid) continue;
                     void ApplyFrame()
                     {
                         lock (_deviceLock)
                         {
+                            // Reject datagrams queued before legacy access was
+                            // revoked or before this listener was replaced.
+                            if (!_isRunning || !_config.AllowLegacyLocalClients || !ReferenceEquals(_udpClient, udpClient)) return;
                             var surfaceChanged = false;
-                            foreach (var item in colors)
+                            foreach (var item in updates)
                             {
-                                int id = item.Value<int>("id");
-                                int r = item.Value<int>("r");
-                                int g = item.Value<int>("g");
-                                int b = item.Value<int>("b");
+                                int id = item.Id;
                                 if (IsV2DeviceLeasedForLegacyLed(id)) continue;
                                 if (_isEmulationMode)
                                 {
                                     if (_emulatedLedMap != null && _emulatedLedMap.TryGetValue(id, out var emu))
                                     {
-                                        emu.R = r / 255f;
-                                        emu.G = g / 255f;
-                                        emu.B = b / 255f;
+                                        emu.R = item.R / 255f;
+                                        emu.G = item.G / 255f;
+                                        emu.B = item.B / 255f;
                                     }
                                 }
                                 else if (_ledIdMap.TryGetValue(id, out Led led))
                                 {
-                                    led.Color = new RGB.NET.Core.Color((byte)r, (byte)g, (byte)b);
+                                    led.Color = new RGB.NET.Core.Color(item.R, item.G, item.B);
                                     surfaceChanged = true;
                                 }
                             }
@@ -1172,6 +1523,16 @@ public class LightingServer
         }
         catch (ObjectDisposedException) { }
         catch (SocketException) { }
+        catch (NullReferenceException) when (!_isRunning || !ReferenceEquals(_udpClient, udpClient)) { }
+    }
+
+    private static bool TryLegacyInteger(JToken? token, int maximum, out int value)
+    {
+        value = 0;
+        return token?.Type == JTokenType.Integer
+            && int.TryParse(token.ToString(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out value)
+            && value >= 0 && value <= maximum;
     }
 
     private bool IsV2DeviceLeasedForLegacyLed(int globalLedId)
@@ -1183,15 +1544,14 @@ public class LightingServer
         }
     }
 
-    private void DiscoveryBroadcastLoop(CancellationToken ct)
+    private void DiscoveryBroadcastLoop(UdpClient client, CancellationToken ct)
     {
-        var client = _discoveryClient!;
         var endpoint = new IPEndPoint(IPAddress.Broadcast, 63214);
         byte[] message = Encoding.UTF8.GetBytes("MINELIGHTS_PROXY_HELLO");
 
         try
         {
-            while (_isRunning && !ct.IsCancellationRequested)
+            while (_isRunning && ReferenceEquals(_discoveryClient, client) && !ct.IsCancellationRequested)
             {
                 try
                 {
@@ -1206,5 +1566,6 @@ public class LightingServer
         }
         catch (ObjectDisposedException) { }
         catch (SocketException) { }
+        catch (NullReferenceException) when (!_isRunning || !ReferenceEquals(_discoveryClient, client)) { }
     }
 }

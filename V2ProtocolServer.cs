@@ -45,6 +45,10 @@ public sealed class V2ProtocolServer : IDisposable
     private readonly Func<JArray> _getDevices;
     private readonly Action<JObject> _applyFrame;
     private readonly Action<IReadOnlyCollection<string>> _restoreDevices;
+    private readonly Action<string, IReadOnlyList<string>?>? _updateProviderInterest;
+    private readonly Action<string>? _removeProviderInterest;
+    private static readonly string[] ProviderNames =
+        { "Corsair", "Logitech", "Asus", "Razer", "Wooting", "SteelSeries", "Msi", "Novation", "PicoPi" };
     private readonly object _deviceCacheLock = new();
     private JArray _deviceSnapshot = new();
     private Dictionary<string, HashSet<uint>> _deviceElements = new(StringComparer.Ordinal);
@@ -85,12 +89,27 @@ public sealed class V2ProtocolServer : IDisposable
     private readonly Dictionary<string, long> _clientOrders = new(StringComparer.Ordinal);
     private bool _stopping;
     private DateTimeOffset _shutdownWhenIdleUntil;
+    // V1 has no session lifetime or heartbeat, so inactivity cannot prove that
+    // an older client has disconnected. Guard the entire opt-in period.
+    private bool _legacyCompatibilityEnabled;
 
     public string ServerId => _serverId;
     public string CertificateFingerprint => _certificateFingerprint;
     public int Port => _actualPort;
     public bool RemoteEnabled => _remoteEnabled;
     public IReadOnlyList<IPAddress> RemoteAddresses => _remoteAddresses;
+
+    public void SetLegacyCompatibilityEnabled(bool enabled)
+    {
+        lock (_storageLock)
+        {
+            if (enabled && _stopping)
+                throw new InvalidOperationException("The server is already stopping.");
+            _legacyCompatibilityEnabled = enabled;
+            if (enabled)
+                _shutdownWhenIdleUntil = default;
+        }
+    }
     public bool IsDeviceLeased(string deviceId)
     {
         lock (_leaseLock)
@@ -117,11 +136,17 @@ public sealed class V2ProtocolServer : IDisposable
         Func<JArray> getDevices,
         Action<JObject> applyFrame,
         Action<IReadOnlyCollection<string>> restoreDevices,
-        string? dataDirectory = null)
+        string? dataDirectory = null,
+        bool legacyCompatibilityEnabled = false,
+        Action<string, IReadOnlyList<string>?>? updateProviderInterest = null,
+        Action<string>? removeProviderInterest = null)
     {
         _getDevices = getDevices;
         _applyFrame = applyFrame;
         _restoreDevices = restoreDevices;
+        _updateProviderInterest = updateProviderInterest;
+        _removeProviderInterest = removeProviderInterest;
+        _legacyCompatibilityEnabled = legacyCompatibilityEnabled;
         _dataDirectory = dataDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "MineLights",
@@ -502,6 +527,11 @@ public sealed class V2ProtocolServer : IDisposable
                 var appVersion = SafeDisplay(payload.Value<string>("app_version"), 64);
                 var minMinor = payload.Value<int?>("min_minor") ?? 0;
                 var maxMinor = payload.Value<int?>("max_minor") ?? 0;
+                if (!TryReadProviders(payload["requested_integrations"], allowMissing: true, out var requestedProviders))
+                {
+                    await TrySendErrorAsync(ssl, "INVALID_INTEGRATIONS", cancellationToken).ConfigureAwait(false);
+                    return;
+                }
                 if (clientId == string.Empty
                     || appId == string.Empty
                     || minMinor < 0
@@ -531,7 +561,7 @@ public sealed class V2ProtocolServer : IDisposable
                     ["server_version"] = ServerVersion,
                     ["selected_minor"] = selectedMinor,
                     ["nonce"] = Base64UrlEncode(serverNonce),
-                    ["capabilities"] = new JArray("device_leases", "generic_devices", "json_frames")
+                    ["capabilities"] = new JArray("device_leases", "generic_devices", "json_frames", "provider_interests")
                 }, cancellationToken).ConfigureAwait(false);
 
                 var auth = await ReadMessageAsync(ssl, cancellationToken).ConfigureAwait(false);
@@ -595,6 +625,10 @@ public sealed class V2ProtocolServer : IDisposable
                     await TrySendAuthResultAsync(ssl, false, Array.Empty<string>(), code, cancellationToken).ConfigureAwait(false);
                     return;
                 }
+                // Interest is accepted only after authentication. A missing
+                // field preserves older V2 clients; an empty array means none.
+                _updateProviderInterest?.Invoke(sessionId,
+                    scopes.Contains("lighting.write", StringComparer.Ordinal) ? requestedProviders : Array.Empty<string>());
                 await WriteMessageAsync(ssl, AuthResultType, new JObject
                 {
                     ["ok"] = true,
@@ -625,15 +659,17 @@ public sealed class V2ProtocolServer : IDisposable
             {
                 ReleaseSessionLeases(sessionId);
                 bool shutdownWhenIdle = false;
+                bool removedSession;
                 lock (_storageLock)
                 {
-                    _activeSessions.TryRemove(sessionId, out _);
-                    if (_shutdownWhenIdleUntil > DateTimeOffset.UtcNow && _activeSessions.IsEmpty && !_stopping)
+                    removedSession = _activeSessions.TryRemove(sessionId, out _);
+                    if (_shutdownWhenIdleUntil > DateTimeOffset.UtcNow && _activeSessions.IsEmpty && !_stopping && !_legacyCompatibilityEnabled)
                     {
                         _stopping = true;
                         shutdownWhenIdle = true;
                     }
                 }
+                if (removedSession) _removeProviderInterest?.Invoke(sessionId);
                 if (shutdownWhenIdle) Program.RequestShutdown();
             }
         }
@@ -874,11 +910,30 @@ public sealed class V2ProtocolServer : IDisposable
         }
         var operation = payload.Value<string>("operation") ?? string.Empty;
         var parameters = payload["params"] as JObject ?? new JObject();
+        if (operation == "integrations.set")
+        {
+            if (!scopes.Contains("lighting.write", StringComparer.Ordinal))
+            {
+                await SendResponseErrorAsync(stream, requestId, "SCOPE_REQUIRED", cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            if (!TryReadProviders(parameters["providers"], allowMissing: false, out var providers))
+            {
+                await SendResponseErrorAsync(stream, requestId, "INVALID_INTEGRATIONS", cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            _updateProviderInterest?.Invoke(sessionId, providers);
+            await SendResponseSuccessAsync(stream, requestId, new JObject { ["providers"] = new JArray(providers!) }, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (operation == "server.info")
         {
+            bool legacyEnabled;
+            lock (_storageLock) legacyEnabled = _legacyCompatibilityEnabled;
             await SendResponseSuccessAsync(stream, requestId, new JObject
             {
-                ["launch_id"] = Program.ClientLaunchId == null ? JValue.CreateNull() : new JValue(Program.ClientLaunchId)
+                ["launch_id"] = Program.ClientLaunchId == null ? JValue.CreateNull() : new JValue(Program.ClientLaunchId),
+                ["legacy_v1_enabled"] = legacyEnabled
             }, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -886,15 +941,22 @@ public sealed class V2ProtocolServer : IDisposable
         if (operation == "server.shutdown")
         {
             bool accepted;
+            bool legacyEnabled;
+            int pendingMs = 0;
             lock (_storageLock)
             {
-                accepted = !_stopping && _activeSessions.ContainsKey(sessionId) && _activeSessions.Count == 1;
+                legacyEnabled = _legacyCompatibilityEnabled;
+                accepted = !_stopping && !legacyEnabled && _activeSessions.ContainsKey(sessionId) && _activeSessions.Count == 1;
                 if (accepted) _stopping = true;
-                else if (!_stopping && Program.ClientStarted && _activeSessions.ContainsKey(sessionId)) _shutdownWhenIdleUntil = DateTimeOffset.UtcNow.AddSeconds(5);
+                else if (!_stopping && !legacyEnabled && Program.ClientStarted && _activeSessions.ContainsKey(sessionId))
+                {
+                    _shutdownWhenIdleUntil = DateTimeOffset.UtcNow.AddSeconds(5);
+                    pendingMs = 5000;
+                }
             }
             if (!accepted)
             {
-                await SendResponseSuccessAsync(stream, requestId, new JObject { ["accepted"] = false, ["reason"] = "other_clients", ["pending_for_ms"] = Program.ClientStarted ? 5000 : 0 }, cancellationToken).ConfigureAwait(false);
+                await SendResponseSuccessAsync(stream, requestId, new JObject { ["accepted"] = false, ["reason"] = legacyEnabled ? "legacy_enabled" : "other_clients", ["pending_for_ms"] = pendingMs }, cancellationToken).ConfigureAwait(false);
                 return;
             }
             try
@@ -1373,9 +1435,30 @@ public sealed class V2ProtocolServer : IDisposable
         "PAIRING_REQUIRED" => "Pair this client with MineLights Server before connecting.",
         "PAIRING_EXPIRED" => "This pairing file has expired. Export a new one from MineLights Server.",
         "BAD_PROOF" => "Client authentication failed.",
+        "INVALID_INTEGRATIONS" => "The requested provider list is invalid.",
         "UNKNOWN_CLIENT" => "This client is not paired with MineLights Server.",
         _ => "The MineLights V2 request could not be accepted."
     };
+
+    private static bool TryReadProviders(JToken? token, bool allowMissing, out IReadOnlyList<string>? providers)
+    {
+        providers = null;
+        if (token == null) return allowMissing;
+        if (token is not JArray values || values.Count > 32 || values.Any(value => value.Type != JTokenType.String))
+            return false;
+        var parsed = new List<string>();
+        foreach (var value in values)
+        {
+            string? name = value.Value<string>();
+            if (string.IsNullOrWhiteSpace(name) || name.Length > 64) return false;
+            var canonical = ProviderNames.FirstOrDefault(item => item.Equals(name, StringComparison.OrdinalIgnoreCase));
+            // Forward-compatible names that this server does not support cannot
+            // initialize an SDK, but must not reject the entire client session.
+            if (canonical != null && !parsed.Contains(canonical, StringComparer.Ordinal)) parsed.Add(canonical);
+        }
+        providers = parsed;
+        return true;
+    }
 
     private void RegisterAuthFailure(IPAddress? address)
     {

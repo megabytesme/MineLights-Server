@@ -1,5 +1,7 @@
 ﻿public class ServerConfig
 {
+    // Absent in older server configurations until the owner reviews filters.
+    public int ConfigSchemaVersion { get; set; }
     public List<string> EnabledIntegrations { get; set; }
     public List<string> DisabledDevices { get; set; } = new();
     public bool AllowLegacyLocalClients { get; set; } = false;
