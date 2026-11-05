@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: minelights-server-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
@@ -17,10 +21,23 @@ jobs:
         with:
           submodules: recursive
 
+      # Refuse any existing draft or published release so a reviewed binary
+      # cannot be replaced by a later rerun.
+      - name: Refuse to replace a release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tags = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check existing GitHub releases.' }
+          if ($tags -contains $env:GITHUB_REF_NAME) {
+            throw "A release for $env:GITHUB_REF_NAME already exists. Preserve its assets; use a new version for a new build."
+          }
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.403'
 
       - name: Verify device definitions
         run: |
@@ -30,6 +47,13 @@ jobs:
 
       - name: Publish self-contained exe
         run: dotnet publish MineLights.csproj -c Release -r win-x64 --self-contained true -m /p:PublishSingleFile=true /p:GeneratePackageOnBuild=false -o ./publish
+
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath ./publish/MineLights.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  MineLights.exe" | Set-Content -LiteralPath ./publish/MineLights.exe.sha256 -Encoding ascii
+          Write-Host "MineLights.exe SHA-256: $hash"
 
       - name: Prepare release notes
         shell: pwsh
@@ -41,10 +65,43 @@ jobs:
             Set-Content -LiteralPath "$env:RUNNER_TEMP/minelights-release-notes.md" -Value "MineLights Server $env:GITHUB_REF_NAME" -Encoding utf8
           }
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ./publish/MineLights.exe
-          body_path: ${{ runner.temp }}/minelights-release-notes.md
+      # Keep the actual CI-built executable available for hashing and review.
+      # Publish this draft only after dependent mods pin its SHA-256; do not rebuild it.
+      - name: Create draft GitHub Release
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" ./publish/MineLights.exe --draft --verify-tag --notes-file "$env:RUNNER_TEMP/minelights-release-notes.md"
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the draft release failed.' }
+
+      # Older MineLights clients select the first release asset, so upload the
+      # executable on its own before adding the checksum.
+      - name: Upload checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$env:GITHUB_REF_NAME" ./publish/MineLights.exe.sha256
+          if ($LASTEXITCODE -ne 0) { throw 'Uploading the checksum failed. Leave the release as a draft.' }
+
+      - name: Verify uploaded assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $expected = 'sha256:' + (Get-FileHash -LiteralPath ./publish/MineLights.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedChecksum = 'sha256:' + (Get-FileHash -LiteralPath ./publish/MineLights.exe.sha256 -Algorithm SHA256).Hash.ToLowerInvariant()
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+            $json = gh release view "$env:GITHUB_REF_NAME" --json assets
+            if ($LASTEXITCODE -ne 0) { throw 'Could not read draft release assets.' }
+            $assets = @(($json | ConvertFrom-Json).assets)
+            $executables = @($assets | Where-Object { $_.name -eq 'MineLights.exe' })
+            $checksums = @($assets | Where-Object { $_.name -eq 'MineLights.exe.sha256' })
+            if ($assets.Count -eq 2 -and $assets[0].name -eq 'MineLights.exe' -and $executables.Count -eq 1 -and $checksums.Count -eq 1 -and $executables[0].digest -eq $expected -and $checksums[0].digest -eq $expectedChecksum) {
+              Write-Host "Verified first uploaded asset MineLights.exe $expected"
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+          }
+          throw 'Uploaded asset order or executable digest is invalid. Leave the release as a draft.'

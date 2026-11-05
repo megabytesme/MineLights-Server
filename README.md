@@ -40,7 +40,7 @@ RGB.NET is provided under its own licence in `third_party/RGB.NET/LICENSE`.
 
 For the MineLights Server to function correctly, please ensure the following requirements are met.
 
-*   **.NET 9.0 (or newer) Desktop Runtime:** The server application is built on .NET and requires the runtime to be installed. You can download it from [Microsoft's official website](https://dotnet.microsoft.com/en-us/download/dotnet/9.0).
+*   **.NET 10 SDK (building from source):** The published Windows executable is self-contained and does not require a separate .NET installation.
 *   **Hardware SDK Software:** For MineLights to control your hardware, the official manufacturer's software and services often need to be running. This includes:
     *   **Corsair:** iCUE (version 4 or newer is recommended).
     *   **Asus:** Aura Sync / Armoury Crate.
@@ -51,9 +51,9 @@ For the MineLights Server to function correctly, please ensure the following req
 
 #### Network
 
-*   **Local Access:** Minecraft and MineLights Server (`MineLights.exe`) must run on the same computer. The server's handshake (TCP `63211`), lighting (UDP `63212`) and command (TCP `63213`) endpoints bind to `127.0.0.1`.
-*   **Discovery:** The server broadcasts `MINELIGHTS_PROXY_HELLO` on UDP `63214` every five seconds so the Minecraft client can detect that it is running. This discovery message is broadcast on the local network.
-*   **Firewall Configuration:** No inbound firewall rule is needed for the server endpoints on `63211`–`63213`, since they accept connections only from the same computer. If Windows asks, allow the Minecraft Java process to receive the UDP `63214` discovery message on private networks.
+*   **Local V2 connection:** MineLights Server listens on an OS-selected TCP port bound to loopback and writes a protected endpoint document under `%LOCALAPPDATA%\MineLights\v2\`. Updated clients use that endpoint for TLS and automatic local enrollment after the user authorizes the server to run.
+*   **Remote V2 connection:** Remote access is off by default. Enable it from the server tray menu, choose the network interfaces and port, then export a one-time `.mlpair` file for the client. Pairing files expire after five minutes and must be transferred securely. MineLights Server does not configure router port forwarding.
+*   **Legacy V1 clients:** Unauthenticated legacy lighting is off by default. The tray menu can enable it for loopback clients only. It does not expose V1 process-management commands.
 
 ---
 
@@ -65,15 +65,21 @@ For the MineLights Server to function correctly, please ensure the following req
 
 ## Usage
 
-### Network API Endpoints
+### V2 Connections
 
-The MineLights server communicates with the client over the local network using a set of TCP and UDP endpoints.
+V2 uses one TLS TCP session for authentication, device discovery, requests, and lighting frames. Local clients discover the endpoint through the protected `endpoint.json` file, then enroll with the local key after the user permits MineLights Server to run. V2 does not use fixed network ports.
+
+The server tray menu provides owner controls for legacy V1 access, remote interface and port selection, pairing-file export, and revoking paired clients. Remote access is authenticated and requires an explicit one-time pairing file. No V2 operation can stop, restart, or reconfigure the server.
+
+### Legacy V1 endpoints (only when explicitly enabled)
+
+Older clients use fixed loopback endpoints without authentication. This compatibility mode is disabled by default and can be enabled from the tray menu. It never enables the old raw command endpoint.
 
 ---
 
 #### 1. Handshake Endpoint
 
-This is the primary endpoint for the client to connect, send its configuration, and receive a detailed layout of all available lighting hardware.
+This endpoint lets a legacy client request the current device layout. The server ignores client hardware-configuration fields; integrations remain server-owner settings.
 
 *   **Protocol:** `TCP`
 *   **Port:** `63211`
@@ -90,12 +96,11 @@ The client initiates the connection and sends a JSON object prefixed with a 32-b
   "disabled_devices": ["Corsair|MM800 RGB POLARIS"]
 }
 ```
-*   **`enabled_integrations`** (Array of Strings): A list of hardware SDKs the server should attempt to initialize.
-*   **`disabled_devices`** (Array of Strings): A list of specific devices (formatted as `"Manufacturer|Model"`) that the server should ignore.
+*   **`enabled_integrations`** and **`disabled_devices`**: Legacy client settings, ignored by the server. Configure server integrations in the server's own `config.json`.
 
 ##### Server -> Client Response
 
-After reconfiguring, the server sends back a JSON object, also prefixed with its length, detailing all discovered and mapped devices.
+The server sends back the current device layout as a JSON object prefixed with its length. The client configuration in its request is ignored.
 
 **Structure:**
 ```json
@@ -172,26 +177,13 @@ A JSON object containing an array of color updates.
 
 #### 3. Command Endpoint
 
-A simple endpoint for sending administrative commands to the server process.
-
-*   **Protocol:** `TCP`
-*   **Port:** `63213`
-*   **Direction:** Client -> Server
-
-##### Client -> Server Payload
-
-A raw UTF-8 string representing the command.
-
-**Available Commands:**
-*   `"shutdown"`: Shuts down the MineLights server application.
-*   `"restart"`: Restarts the server with standard user privileges.
-*   `"restart_admin"`: Restarts the server with elevated (administrator) privileges.
+TCP `63213` remains bound to loopback as a presence probe so older clients can detect the server and continue to their legacy handshake. The listener closes every connection immediately without reading payloads; V1 commands are never executed. Shutdown and restart are available only from the server owner's tray controls.
 
 ---
 
 #### 4. Discovery Endpoint
 
-The server uses this endpoint to announce its presence on the local network, allowing the client to find it automatically without requiring a hardcoded IP address.
+When legacy compatibility is enabled, the server uses this endpoint to announce itself on the local network for older clients.
 
 *   **Protocol:** `UDP Broadcast`
 *   **Port:** `63214`
