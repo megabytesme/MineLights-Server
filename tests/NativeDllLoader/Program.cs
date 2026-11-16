@@ -118,11 +118,15 @@ if (args.Length == 2 && args[0] == "--assert-reparse-rejected")
     throw new InvalidOperationException("The protected cache accepted a reparse-point parent.");
 }
 
-var testRoot = Path.Combine(Path.GetTempPath(), "MineLights.NativeDllLoader.Tests", Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(testRoot);
+var fixtureRoot = Path.Combine(Path.GetTempPath(), "MineLights.NativeDllLoader.Tests", Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(fixtureRoot);
+var testRoot = fixtureRoot;
 
 try
 {
+    using var identity = WindowsIdentity.GetCurrent();
+    if (new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+        testRoot = NativeDllLoader.PrepareProtectedCacheRoot(fixtureRoot);
     VerifyContentAddressedExtraction();
     VerifyUnexpectedCachedDllIsReplaced();
     VerifyVersionsUseSeparateDirectories();
@@ -134,7 +138,7 @@ try
 }
 finally
 {
-    Directory.Delete(testRoot, recursive: true);
+    Directory.Delete(fixtureRoot, recursive: true);
 }
 
 void VerifyContentAddressedExtraction()
