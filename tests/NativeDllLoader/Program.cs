@@ -1,4 +1,122 @@
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Reflection;
+using RGB.NET.Devices.Corsair;
+using RGB.NET.Devices.Logitech;
+using RGB.NET.Devices.Msi;
+using RGB.NET.Devices.Wooting;
+
+if (args.Length == 2 && args[0] == "--cleanup-test-fixture")
+{
+    string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+    string target = Path.GetFullPath(args[1]);
+    if (!target.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException("Fixture cleanup is restricted to the system temp directory.");
+    EnsureTreeHasNoReparsePoints(target);
+    Directory.Delete(target, recursive: true);
+    Console.WriteLine("Temporary ACL fixture removed.");
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--prepare-protected-cache-root")
+{
+    Console.WriteLine(NativeDllLoader.PrepareProtectedCacheRoot(args[1]));
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--populate-protected-cache")
+{
+    string root = NativeDllLoader.PrepareProtectedCacheRoot(args[1]);
+    Assembly assembly = typeof(NativeDllLoader).Assembly;
+    string version = assembly.GetName().Version!.ToString();
+    string versionPath = Path.Combine(root, "x64", version);
+    Directory.CreateDirectory(versionPath);
+    NativeDllLoader.ValidateNoReparsePoints(versionPath);
+
+    foreach ((string resourceName, string fileName) in new[]
+    {
+        ("MineLights.resources.x64.iCUESDK.x64_2019.dll", "iCUESDK.x64_2019.dll"),
+        ("MineLights.resources.x64.MysticLight_SDK_x64.dll", "MysticLight_SDK_x64.dll"),
+        ("MineLights.resources.x64.LogitechLedEnginesWrapper.dll", "LogitechLedEnginesWrapper.dll"),
+        ("MineLights.resources.x64.wooting-rgb-sdk.dll", "wooting-rgb-sdk.dll"),
+    })
+    {
+        using Stream stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new FileNotFoundException($"Embedded DLL not found: {resourceName}");
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        Console.WriteLine(NativeDllLoader.ExtractVerifiedResource(memory.ToArray(), versionPath, fileName));
+    }
+
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--configure-protected-native-paths")
+{
+    string version = typeof(NativeDllLoader).Assembly.GetName().Version!.ToString();
+    NativeDllLoader.ConfigureNativeSdkPaths(Path.Combine(args[1], "x64", version));
+    AssertProviderPath(CorsairDeviceProvider.PossibleX64NativePaths, "iCUESDK.x64_2019.dll");
+    AssertProviderPath(MsiDeviceProvider.PossibleX64NativePaths, "MysticLight_SDK_x64.dll");
+    AssertProviderPath(LogitechDeviceProvider.PossibleX64NativePaths, "LogitechLedEnginesWrapper.dll");
+    AssertProviderPath(WootingDeviceProvider.PossibleX64NativePathsWindows, "wooting-rgb-sdk.dll");
+    Console.WriteLine("All RGB.NET providers use only their verified absolute DLL path.");
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--assert-no-reparse")
+{
+    NativeDllLoader.ValidateNoReparsePoints(args[1]);
+    Console.WriteLine("Cache ancestry contains no reparse points.");
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--verify-protected-cache-acl")
+{
+    var directory = new DirectoryInfo(args[1]);
+    NativeDllLoader.VerifyProtectedDirectorySecurity(directory.GetAccessControl(
+        AccessControlSections.Access | AccessControlSections.Owner));
+    foreach (string childDirectory in Directory.EnumerateDirectories(directory.FullName, "*", SearchOption.AllDirectories))
+        NativeDllLoader.VerifyProtectedCacheObjectSecurity(new DirectoryInfo(childDirectory).GetAccessControl(
+            AccessControlSections.Access | AccessControlSections.Owner));
+    foreach (string childFile in Directory.EnumerateFiles(directory.FullName, "*", SearchOption.AllDirectories))
+        NativeDllLoader.VerifyProtectedCacheObjectSecurity(new FileInfo(childFile).GetAccessControl(
+            AccessControlSections.Access | AccessControlSections.Owner));
+    Console.WriteLine("Protected cache ACL verified.");
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--assert-cache-write-denied")
+{
+    AssertDenied(() => File.WriteAllText(Path.Combine(args[1], $"write-probe-{Guid.NewGuid():N}.tmp"), "unexpected write"));
+    string? cachedFile = Directory.EnumerateFiles(args[1], "*.dll", SearchOption.AllDirectories).FirstOrDefault();
+    if (cachedFile == null)
+        throw new InvalidOperationException("The protected cache has no DLL file to test.");
+    AssertDenied(() => File.WriteAllBytes(cachedFile, [99, 98, 97]));
+    AssertDenied(() => File.Delete(cachedFile));
+    var acl = new DirectoryInfo(args[1]).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+    SecurityIdentifier userSid = WindowsIdentity.GetCurrent().User!;
+    acl.AddAccessRule(new FileSystemAccessRule(userSid, FileSystemRights.FullControl,
+        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+    AssertDenied(() => new DirectoryInfo(args[1]).SetAccessControl(acl));
+    Console.WriteLine("Standard user could not create, modify, delete, or change ACLs in the protected cache.");
+    return;
+}
+
+if (args.Length == 2 && args[0] == "--assert-reparse-rejected")
+{
+    try
+    {
+        NativeDllLoader.PrepareProtectedCacheRoot(args[1]);
+    }
+    catch (IOException)
+    {
+        Console.WriteLine("Reparse-point cache parent rejected.");
+        return;
+    }
+
+    throw new InvalidOperationException("The protected cache accepted a reparse-point parent.");
+}
 
 var testRoot = Path.Combine(Path.GetTempPath(), "MineLights.NativeDllLoader.Tests", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(testRoot);
@@ -11,6 +129,7 @@ try
     VerifyConcurrentExtraction();
     VerifySearchPathExcludesFallbacks();
     VerifyUnsafePathsAreRejected();
+    VerifyProtectedAclDescriptor();
     Console.WriteLine("All NativeDllLoader checks passed.");
 }
 finally
@@ -92,10 +211,58 @@ void VerifyUnsafePathsAreRejected()
         "A relative native library path was accepted.");
 }
 
+void VerifyProtectedAclDescriptor()
+{
+    var security = NativeDllLoader.CreateProtectedDirectorySecurity();
+    NativeDllLoader.VerifyProtectedDirectorySecurity(security);
+}
+
 void Assert(bool condition, string message)
 {
     if (!condition)
         throw new InvalidOperationException(message);
+}
+
+void AssertDenied(Action action)
+{
+    try
+    {
+        action();
+    }
+    catch (UnauthorizedAccessException)
+    {
+        return;
+    }
+    catch (IOException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException("The standard user token could modify the protected cache.");
+}
+
+void AssertProviderPath(IList<string> paths, string expectedFileName)
+{
+    if (paths.Count != 1 || !Path.IsPathFullyQualified(paths[0]) ||
+        Path.GetFileName(paths[0]) != expectedFileName || !File.Exists(paths[0]))
+    {
+        throw new InvalidOperationException($"RGB.NET provider path is not the verified {expectedFileName}.");
+    }
+}
+
+void EnsureTreeHasNoReparsePoints(string root)
+{
+    var pending = new Stack<string>();
+    pending.Push(root);
+    while (pending.TryPop(out string? current))
+    {
+        if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException($"Refusing cleanup through reparse point: {current}");
+        if ((File.GetAttributes(current) & FileAttributes.Directory) == 0)
+            continue;
+        foreach (string child in Directory.EnumerateFileSystemEntries(current))
+            pending.Push(child);
+    }
 }
 
 void AssertThrows<TException>(Action action, string message) where TException : Exception
